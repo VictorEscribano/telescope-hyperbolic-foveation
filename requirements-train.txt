@@ -1,0 +1,12 @@
+# ── Training & evaluation extras ──────────────────────────────────────
+# Needed only to train/evaluate on real data (train.py, eval.py, notebook 06).
+# Install AFTER requirements.txt:
+#     pip install -r requirements-train.txt
+#
+# These are kept separate because they are heavier and occasionally harder
+# to build than the core dependencies. The learning notebooks (01–05) do
+# NOT require them.
+
+transformers>=4.40.0     # real Deformable DETR (replaces the stub decoder)
+av2>=0.3.0               # Argoverse 2 dataset loader
+pycocotools>=2.0.7       # full COCO mAP metrics (eval.py falls back without it)

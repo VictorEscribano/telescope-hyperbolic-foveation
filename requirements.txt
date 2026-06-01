@@ -1,0 +1,24 @@
+# ── Core dependencies ─────────────────────────────────────────────────
+# Everything needed to run the telescope package and notebooks 01–05.
+# For training on real data (notebook 06, train.py, eval.py) also install
+# requirements-train.txt.
+
+# Deep learning core
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24.0
+
+# Geometry / matching / plotting
+scipy>=1.11.0            # HungarianMatcher (linear_sum_assignment)
+matplotlib>=3.7.0        # all notebook plots
+Pillow>=10.0.0           # image loading
+
+# Notebook tooling
+jupyter>=1.0.0
+ipywidgets>=8.0.0
+scikit-learn>=1.3.0      # PCA visualisation in notebook 03
+torchview>=0.2.6         # model graph diagrams
+tqdm>=4.65.0             # progress bars
+
+# Model download
+huggingface_hub>=0.23.0  # SAM3.1 / SAM2.1 checkpoint download

@@ -1,0 +1,49 @@
+# ── Virtual environments ──────────────────────────────────────────────
+.telescope/
+.venv/
+venv/
+env/
+
+# ── Model checkpoints & weights (heavy) ───────────────────────────────
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# ── Datasets (heavy) ──────────────────────────────────────────────────
+data/
+
+# ── Third-party cloned repos ──────────────────────────────────────────
+sam3/
+sam2/
+
+# ── Training outputs ──────────────────────────────────────────────────
+runs/
+*.log
+
+# ── The paper PDF (large; available on arXiv) ─────────────────────────
+*.pdf
+
+# ── Python build / cache ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ── Notebook artifacts ────────────────────────────────────────────────
+.ipynb_checkpoints/
+notebooks/foveation_estimator_graph
+notebooks/*.png
+
+# ── Generated results ─────────────────────────────────────────────────
+*_results.json
+comparison.png
+
+# ── OS / editor ───────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
