@@ -22,15 +22,18 @@ import os
 import time
 from pathlib import Path
 
+# Reduce allocator fragmentation before any CUDA tensors are created.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, DistributedSampler
 
 from telescope.pipeline import TelescopeModel
-from telescope.matcher import HungarianMatcher, match_and_compute_loss
-from telescope.eval import CocoEvaluator, DetectionResult
+from telescope.matcher import HungarianMatcher, match_and_compute_loss, compute_denoising_loss
+from telescope.eval import CocoEvaluator, DetectionResult, DISTANCE_BINS
 from telescope.data import Argoverse2Dataset, collate_fn, NUM_CLASSES, CLASS_NAMES
 from telescope.checkpoint import CheckpointManager
 
@@ -60,6 +63,14 @@ def parse_args():
                    help="disable foveation (R fixed near zero) for ablation baseline")
     p.add_argument("--grad_accum",   type=int, default=1,
                    help="gradient accumulation steps (use 2 on 14GB VRAM for effective batch=4)")
+    p.add_argument("--denoising",    action="store_true", default=True,
+                   help="DINO-style denoising auxiliary loss (paper §4)")
+    p.add_argument("--no_denoising", dest="denoising", action="store_false",
+                   help="disable the denoising auxiliary loss")
+    p.add_argument("--dn_noise_scale", type=float, default=0.4,
+                   help="box-relative Gaussian noise std for denoising queries")
+    p.add_argument("--dn_weight",    type=float, default=1.0,
+                   help="weight of the denoising loss in the total")
     return p.parse_args()
 
 
@@ -112,13 +123,10 @@ def main():
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr,
                                    weight_decay=args.weight_decay)
-    # Lambda LR with 1 warm-up epoch (paper Table 9)
-    def lr_lambda(epoch):
-        if epoch < 1:
-            return epoch + 1e-8          # warm-up: linear ramp
-        return 1.0
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler    = GradScaler(enabled=args.fp16)
+    # init_scale below the 2**16 default: the geometry runs in fp32 but the DETR
+    # is fp16, and a lower starting scale avoids a few wasted overflow steps
+    # while the scaler settles (it still adapts up/down as needed).
+    scaler    = GradScaler("cuda", enabled=args.fp16, init_scale=2**13)
 
     # ── Checkpoint manager ────────────────────────────────────────────────────
     ckpt_mgr    = CheckpointManager(args.output_dir, keep_last=3)
@@ -147,6 +155,19 @@ def main():
         num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
     )
 
+    # ── LR warm-up (paper Table 9: 1 warm-up epoch) ───────────────────────────
+    # Implemented as a per-iteration linear ramp over the first epoch, then
+    # constant.  The previous per-epoch LambdaLR evaluated the ramp at epoch
+    # index 0 → factor 1e-8, i.e. the entire first epoch trained at ~0 LR.
+    warmup_iters = len(train_loader)
+    def set_lr(global_step: int) -> float:
+        scale = min(1.0, (global_step + 1) / max(1, warmup_iters))
+        lr = args.lr * scale
+        for g in optimizer.param_groups:
+            g["lr"] = lr
+        return lr
+    global_step = start_epoch * len(train_loader)
+
     # ── Matching + evaluation ─────────────────────────────────────────────────
     matcher = HungarianMatcher(cost_cls=1.0, cost_l1=5.0, cost_giou=2.0)
 
@@ -168,40 +189,59 @@ def main():
             if step % args.grad_accum == 0:
                 optimizer.zero_grad()
 
-            with autocast(enabled=args.fp16):
+            with autocast("cuda", enabled=args.fp16):
                 _model = model.module if world_size > 1 else model
 
-                # baseline ablation: override o,R so Phi = identity
-                boxes_eu, logits, o, R, boxes_ri = _model(
-                    images, return_riemannian=True
-                )
-                if args.no_foveation:
-                    R = torch.full_like(R, 0.001)   # w(r)=0 → Phi(x)=x
+                # baseline ablation (--no_foveation) is handled inside the model
+                # forward, which forces R≈0 so warp, embedding, and decode all
+                # use the identity transform consistently.
+                dn_in = ((gt_boxes_list, gt_labels_list, args.dn_noise_scale)
+                         if args.denoising else None)
+                out = _model(images, return_riemannian=True, denoising=dn_in)
+                if args.denoising:
+                    boxes_eu, logits, o, R, boxes_ri, dn_out = out
+                else:
+                    boxes_eu, logits, o, R, boxes_ri = out
+                    dn_out = None
 
                 losses = match_and_compute_loss(
                     boxes_ri, logits,
                     gt_boxes_list, gt_labels_list,
                     o, R, matcher, NUM_CLASSES,
                 )
+                total = losses["loss_total"]
+
+                # DINO-style denoising auxiliary loss (dn_out is None when the
+                # batch has no GT boxes even with --denoising on).
+                if dn_out is not None:
+                    dn = compute_denoising_loss(
+                        dn_out, gt_boxes_list, gt_labels_list,
+                        o, R, NUM_CLASSES,
+                    )
+                    total = total + args.dn_weight * dn["loss_dn"]
+                    losses["n_dn"] = dn["n_dn"]
+
                 # scale loss for gradient accumulation
-                loss = losses["loss_total"] / args.grad_accum
+                loss = total / args.grad_accum
 
             scaler.scale(loss).backward()
 
             if (step + 1) % args.grad_accum == 0 or (step + 1) == len(train_loader):
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                set_lr(global_step)
                 scaler.step(optimizer)
                 scaler.update()
+            global_step += 1
 
             epoch_loss += losses["loss_total"].item()
 
             if is_main and step % 50 == 0:
+                dn_str = f"  dn={losses['n_dn']}" if "n_dn" in losses else ""
                 print(f"  epoch {epoch:3d}  step {step:5d}/{len(train_loader)}  "
                       f"loss={losses['loss_total'].item():.4f}  "
-                      f"matched={losses['n_matched']}")
+                      f"matched={losses['n_matched']}{dn_str}")
 
-        scheduler.step()
         avg_loss = epoch_loss / len(train_loader)
 
         # ── Validation ────────────────────────────────────────────────────────
@@ -213,8 +253,15 @@ def main():
             metrics["loss"] = avg_loss
             elapsed = time.time() - t0
             print(f"epoch {epoch:3d}  loss={avg_loss:.4f}  "
-                  f"mAP={metrics.get('mAP_50', 0):.4f}  "
+                  f"mAP={metrics.get('mAP', 0):.4f}  "
+                  f"mAP50={metrics.get('mAP_50', 0):.4f}  "
                   f"time={elapsed:.0f}s")
+            # Per-distance-bin mAP (paper's headline metric), when available
+            dist_bins = [f"{name}={metrics[f'mAP_{name}']:.3f}"
+                         for name, _, _ in DISTANCE_BINS
+                         if f"mAP_{name}" in metrics]
+            if dist_bins:
+                print("           mAP by distance(m):  " + "  ".join(dist_bins))
             ckpt_mgr.save(
                 model if world_size == 1 else model.module,
                 optimizer, epoch, metrics, scaler
@@ -247,12 +294,16 @@ def _run_validation(model, val_loader, device) -> dict:
 
 
 def _load_sam3_backbone(model, ckpt_path, device):
-    """Swap SAM3EncoderStub for real SAM3.1 weights once available."""
-    # TODO: replace with actual SAM3 loading API when confirmed
-    # from sam3 import build_sam3
-    # sam3 = build_sam3(config="...", checkpoint=ckpt_path)
-    # model.backbone = sam3.image_encoder
-    print(f"[backbone] SAM3.1 loading from {ckpt_path} — TODO: wire up after API confirmed")
+    """Swap SAM3EncoderStub for the real frozen SAM3.1 vision encoder."""
+    from telescope.backbone_sam3 import SAM3Backbone
+    print(f"[backbone] loading real SAM3.1 vision encoder from {ckpt_path} ...")
+    real = SAM3Backbone(
+        checkpoint_path=ckpt_path,
+        out_channels=model.backbone.out_channels,   # = query_dim (must be 256)
+    ).to(device)
+    model.backbone = real
+    n = sum(p.numel() for p in real.parameters())
+    print(f"[backbone] SAM3.1 vision encoder wired ({n/1e6:.0f}M params, will be frozen)")
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from scipy.optimize import linear_sum_assignment
 from .box import riemannian_to_euclidean_box
 from .head import generalized_box_iou
 
-__all__ = ["HungarianMatcher", "match_and_compute_loss"]
+__all__ = ["HungarianMatcher", "match_and_compute_loss", "compute_denoising_loss"]
 
 
 class HungarianMatcher:
@@ -196,4 +196,70 @@ def match_and_compute_loss(
         loss_giou=loss_giou,
         loss_cls=loss_cls,
         n_matched=n_matched,
+    )
+
+
+def compute_denoising_loss(
+    dn_out:           dict,        # from TelescopeModel._denoising_pass
+    gt_boxes_list:    list,        # list of (M_b, 4) Euclidean GT boxes
+    gt_labels_list:   list,        # list of (M_b,)   GT labels
+    o:                Tensor,      # (B, 2)
+    R:                Tensor,      # (B,)
+    num_classes:      int,
+    alpha:            float = 2.0,
+    p:                float = 2.0,
+    lambda_l1:        float = 5.0,
+    lambda_giou:      float = 2.0,
+    lambda_cls:       float = 1.0,
+) -> dict:
+    """DINO-style denoising loss (no Hungarian matching).
+
+    Each denoising query corresponds 1-to-1 to a GT box, so we supervise it
+    directly: decode the predicted Riemannian box to Euclidean and apply the
+    same L1 + gIoU + classification losses against its GT.  This gives a dense,
+    stable training signal that accelerates convergence (Telescope paper §4).
+
+    Args:
+        dn_out : dict with 'boxes_ri' (B,M,4), 'logits' (B,M,C), 'mask' (B,M)
+    Returns:
+        dict with loss_dn, loss_dn_l1, loss_dn_giou, loss_dn_cls, n_dn
+    """
+    from .box import riemannian_to_euclidean_box
+    from .head import generalized_box_iou
+
+    boxes_ri = dn_out["boxes_ri"]    # (B, M, 4)
+    logits   = dn_out["logits"]      # (B, M, C)
+    mask     = dn_out["mask"]        # (B, M)
+    B = boxes_ri.shape[0]
+
+    total_l1   = boxes_ri.new_zeros(1)
+    total_giou = boxes_ri.new_zeros(1)
+    total_cls  = boxes_ri.new_zeros(1)
+    n_dn = 0
+
+    for b in range(B):
+        m = int(mask[b].sum())
+        if m == 0:
+            continue
+        gt  = gt_boxes_list[b].to(boxes_ri.device)[:m]    # (m, 4)
+        lbl = gt_labels_list[b].to(logits.device)[:m]     # (m,)
+
+        pred_eu = riemannian_to_euclidean_box(boxes_ri[b, :m], o[b], R[b], alpha, p)
+        total_l1   = total_l1   + F.l1_loss(pred_eu, gt)
+        total_giou = total_giou + (1.0 - generalized_box_iou(pred_eu, gt)).mean()
+        total_cls  = total_cls  + F.cross_entropy(logits[b, :m], lbl)
+        n_dn += m
+
+    denom    = max(B, 1)
+    loss_l1  = total_l1   / denom
+    loss_giou= total_giou / denom
+    loss_cls = total_cls  / denom
+    loss_dn  = lambda_l1 * loss_l1 + lambda_giou * loss_giou + lambda_cls * loss_cls
+
+    return dict(
+        loss_dn=loss_dn,
+        loss_dn_l1=loss_l1,
+        loss_dn_giou=loss_giou,
+        loss_dn_cls=loss_cls,
+        n_dn=n_dn,
     )

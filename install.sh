@@ -191,17 +191,117 @@ hdr "4/5  Argoverse 2 dataset (optional)"
 
 DATA_DIR="${PROJECT_DIR}/data/argoverse2"
 
-if [[ -d "$DATA_DIR" ]] && [[ -n "$(ls -A "$DATA_DIR" 2>/dev/null)" ]]; then
-    ok "Argoverse 2 data already present at data/argoverse2"
-elif ask_yn "Download Argoverse 2 dataset? (large — tens of GB, only needed for training)"; then
-    if python -c "import av2" 2>/dev/null; then
-        mkdir -p "$DATA_DIR"
-        info "Starting Argoverse 2 download (this takes a while) ..."
-        python -m av2.datasets.sensor.download --target_dir "$DATA_DIR" \
-            && ok "Argoverse 2 downloaded" \
-            || warn "Download failed — see github.com/argoverse/av2-api"
+# Install s5cmd (fast parallel S3 downloader) into the venv if not present.
+ensure_s5cmd() {
+    command -v s5cmd >/dev/null 2>&1 && return 0
+    [[ -x "${VENV_DIR}/bin/s5cmd" ]] && return 0
+    info "Installing s5cmd (fast S3 downloader) ..."
+    local tmp
+    tmp=$(mktemp -d)
+    if wget -q --show-progress \
+           "https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz" \
+           -O "${tmp}/s5cmd.tar.gz" \
+        && tar xzf "${tmp}/s5cmd.tar.gz" -C "$tmp" s5cmd \
+        && mv "${tmp}/s5cmd" "${VENV_DIR}/bin/s5cmd"; then
+        ok "s5cmd installed"
+        rm -rf "$tmp"
     else
+        err "Failed to install s5cmd. Check your internet connection."
+        rm -rf "$tmp"
+        return 1
+    fi
+}
+
+# Print a numbered menu and return "<n_train> <n_val>".
+# All display output goes to stderr so it isn't captured when called inside $().
+# read uses /dev/tty directly so it works even in a subshell.
+ask_subset() {
+    echo -e "${YELLOW}?${NC} How much data to download?" >&2
+    echo "  Each 'log' is one ~20 s drive segment with LiDAR sweeps, 9 cameras, and 3-D box annotations." >&2
+    echo >&2
+    echo "  1) Small sample   —   5 train +   5 val  (~5 GB)   Verify the pipeline runs; not enough to train." >&2
+    echo "  2) Medium subset  —  20 train +  10 val  (~20 GB)  Quick training run; expect lower mAP than full." >&2
+    echo "  3) Large subset   —  50 train +  20 val  (~60 GB)  Decent experiments; ~7 % of full train split." >&2
+    echo "  4) Full dataset   — 700 train + 150 val (~500 GB)  Complete split for publication-quality results." >&2
+    printf '%b' "${YELLOW}  Choice [1-4, default 2]: ${NC}" >&2
+    local choice
+    IFS= read -r choice < /dev/tty
+    case "$choice" in
+        1) echo "5 5" ;;
+        3) echo "50 20" ;;
+        4) echo "700 150" ;;
+        *) echo "20 10" ;;
+    esac
+}
+
+# Download n_train train logs and n_val val logs from the public S3 bucket.
+download_av2_subset() {
+    local n_train="$1" n_val="$2"
+    local s5cmd_bin
+    s5cmd_bin=$(command -v s5cmd 2>/dev/null || echo "${VENV_DIR}/bin/s5cmd")
+
+    local train_ids val_ids
+    train_ids=$(python - <<PYEOF
+from av2.datasets.sensor.splits import TRAIN
+print('\n'.join(TRAIN[:${n_train}]))
+PYEOF
+)
+    val_ids=$(python - <<PYEOF
+from av2.datasets.sensor.splits import VAL
+print('\n'.join(VAL[:${n_val}]))
+PYEOF
+)
+
+    local total=$(( n_train + n_val ))
+    info "Downloading ${n_train} train + ${n_val} val logs (${total} total) ..."
+
+    local failed=0
+
+    while IFS= read -r log_id; do
+        [[ -z "$log_id" ]] && continue
+        local dest="${DATA_DIR}/sensor/train/${log_id}"
+        if [[ -d "$dest" ]] && [[ -n "$(ls -A "$dest" 2>/dev/null)" ]]; then
+            info "  [skip] train/${log_id}"
+            continue
+        fi
+        mkdir -p "$dest"
+        info "  train/${log_id}"
+        "$s5cmd_bin" --no-sign-request cp \
+            "s3://argoverse/datasets/av2/sensor/train/${log_id}/*" "${dest}/" \
+            || { warn "  Failed: train/${log_id}"; failed=$((failed + 1)); }
+    done <<< "$train_ids"
+
+    while IFS= read -r log_id; do
+        [[ -z "$log_id" ]] && continue
+        local dest="${DATA_DIR}/sensor/val/${log_id}"
+        if [[ -d "$dest" ]] && [[ -n "$(ls -A "$dest" 2>/dev/null)" ]]; then
+            info "  [skip] val/${log_id}"
+            continue
+        fi
+        mkdir -p "$dest"
+        info "  val/${log_id}"
+        "$s5cmd_bin" --no-sign-request cp \
+            "s3://argoverse/datasets/av2/sensor/val/${log_id}/*" "${dest}/" \
+            || { warn "  Failed: val/${log_id}"; failed=$((failed + 1)); }
+    done <<< "$val_ids"
+
+    if (( failed > 0 )); then
+        warn "${failed} log(s) failed. Re-run install.sh to retry (skips already-downloaded logs)."
+        return 1
+    fi
+    ok "Argoverse 2 subset downloaded (${n_train} train + ${n_val} val)"
+}
+
+n_train_present=$(find "${DATA_DIR}/sensor/train" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+if (( n_train_present > 0 )); then
+    ok "Argoverse 2 data already present (${n_train_present} train logs at data/argoverse2/sensor/train)"
+elif ask_yn "Download Argoverse 2 dataset? (only needed for training)"; then
+    if ! python -c "import av2" 2>/dev/null; then
         warn "av2 not installed. Install training extras first, then re-run."
+    elif ensure_s5cmd; then
+        read -r n_train n_val <<< "$(ask_subset)"
+        mkdir -p "${DATA_DIR}/sensor"
+        download_av2_subset "$n_train" "$n_val"
     fi
 else
     info "Skipped dataset download. You can train later once data is available."

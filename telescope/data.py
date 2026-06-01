@@ -19,6 +19,7 @@ Self-Driving Perception and Forecasting", 2023.
 """
 
 import os
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -87,11 +88,16 @@ class Argoverse2Dataset(Dataset):
         self.camera     = camera
         self.max_dist   = max_dist
 
-        # Build flat index: list of (log_id, timestamp_ns) pairs
+        # Build flat index: only keep LiDAR timestamps that have a
+        # synchronised camera image within the 25 ms default window.
+        # get_closest_img_fpath returns None when no image is close enough;
+        # filtering here avoids crashes inside DataLoader workers.
         self._index: List[Tuple[str, int]] = []
         for log_id in self._av2.get_log_ids():
             for ts in self._av2.get_ordered_log_lidar_timestamps(log_id):
-                self._index.append((log_id, ts))
+                img_path = self._av2.get_closest_img_fpath(log_id, self.camera, ts)
+                if img_path is not None:
+                    self._index.append((log_id, ts))
 
     def __len__(self) -> int:
         return len(self._index)
@@ -100,8 +106,9 @@ class Argoverse2Dataset(Dataset):
         log_id, timestamp_ns = self._index[idx]
 
         # ── Load image ────────────────────────────────────────────────────────
+        # img_path is guaranteed non-None because the index was filtered at init.
         img_path = self._av2.get_closest_img_fpath(log_id, self.camera, timestamp_ns)
-        image    = self._load_image(img_path)   # (3, H, W) in [0, 1]
+        image    = self._load_image(img_path)  # (3, H, W) in [0, 1]
 
         H_orig, W_orig = image.shape[-2:]
         image = F.interpolate(
@@ -113,14 +120,18 @@ class Argoverse2Dataset(Dataset):
 
         # ── Load 3D annotations and project to 2D ────────────────────────────
         try:
-            cuboids   = self._av2.get_labels_at_lidar_timestamp(log_id, timestamp_ns)
-            cam_params = self._av2.get_camera_params(log_id, self.camera)
-            boxes_2d, labels = self._project_cuboids(
-                cuboids, cam_params, W_orig, H_orig
+            cuboid_list = self._av2.get_labels_at_lidar_timestamp(log_id, timestamp_ns)
+            cam         = self._av2.get_log_pinhole_camera(log_id, self.camera)
+            boxes_2d, labels, distances = self._project_cuboids(
+                cuboid_list.cuboids, cam, W_orig, H_orig
             )
-        except Exception:
-            boxes_2d = torch.zeros(0, 4)
-            labels   = torch.zeros(0, dtype=torch.long)
+        except Exception as exc:
+            warnings.warn(
+                f"[Argoverse2Dataset] annotation error at {log_id}/{timestamp_ns}: {exc}"
+            )
+            boxes_2d  = torch.zeros(0, 4)
+            labels    = torch.zeros(0, dtype=torch.long)
+            distances = torch.zeros(0, dtype=torch.float32)
 
         # ── Normalise boxes to [-1, 1]² ───────────────────────────────────────
         if len(boxes_2d) > 0:
@@ -131,10 +142,11 @@ class Argoverse2Dataset(Dataset):
             boxes_2d[:, 3] = boxes_2d[:, 3] / H_orig * 2        # h
 
         return image, {
-            "boxes":    boxes_2d,
-            "labels":   labels,
-            "image_id": idx,
-            "log_id":   log_id,
+            "boxes":     boxes_2d,
+            "labels":    labels,
+            "distances": distances,    # (M,) metres — for per-distance-bin mAP
+            "image_id":  idx,
+            "log_id":    log_id,
             "timestamp_ns": timestamp_ns,
         }
 
@@ -144,29 +156,33 @@ class Argoverse2Dataset(Dataset):
         img = Image.open(img_path).convert("RGB")
         return TF.to_tensor(img)   # (3, H, W) in [0, 1]
 
-    def _project_cuboids(self, cuboids, cam_params, W_orig, H_orig):
-        """Project 3D cuboids to 2D [cx, cy, w, h] boxes in pixel coords."""
-        boxes, labels = [], []
+    def _project_cuboids(self, cuboids, cam, W_orig, H_orig):
+        """Project 3D cuboids to 2D [cx, cy, w, h] boxes in pixel coords.
+
+        Returns boxes (M,4), labels (M,), and distances (M,) in metres — the
+        latter drives the per-distance-bin mAP used in the TruckDrive protocol.
+        """
+        boxes, labels, distances = [], [], []
 
         for cuboid in cuboids:
             # Filter by class
             cat = cuboid.category
-            if cat not in _AV2_TO_IDX:
+            if cat is None or cat not in _AV2_TO_IDX:
                 continue
 
-            # Filter by distance
-            dist = float(np.linalg.norm(cuboid.dst_SE3_object.translation[:2]))
+            # Range to the object (ego frame, ground-plane distance)
+            dist = float(np.linalg.norm(cuboid.xyz_center_m[:2]))
             if dist > self.max_dist:
                 continue
 
             # Project 8 corners to image plane
-            corners_3d = cuboid.vertices_m                    # (8, 3)
-            uvz = cam_params.project_ego_to_img(corners_3d)  # (8, 3) [u, v, z]
-            # Only keep corners in front of camera
-            in_front = uvz[:, 2] > 0
+            corners_3d = cuboid.vertices_m                          # (8, 3)
+            uv, points_cam, _ = cam.project_ego_to_img(corners_3d) # uv:(8,2) pts:(8,3)
+            # Only keep corners in front of camera (positive Z in camera frame)
+            in_front = points_cam[:, 2] > 0
             if in_front.sum() < 4:
                 continue
-            uv = uvz[in_front, :2]
+            uv = uv[in_front]
 
             # Axis-aligned bounding box over projected corners
             x1, y1 = uv[:, 0].min(), uv[:, 1].min()
@@ -184,11 +200,14 @@ class Argoverse2Dataset(Dataset):
 
             boxes.append([cx, cy, w, h])
             labels.append(_AV2_TO_IDX[cat])
+            distances.append(dist)
 
         if boxes:
-            return torch.tensor(boxes, dtype=torch.float32), \
-                   torch.tensor(labels, dtype=torch.long)
-        return torch.zeros(0, 4), torch.zeros(0, dtype=torch.long)
+            return (torch.tensor(boxes, dtype=torch.float32),
+                    torch.tensor(labels, dtype=torch.long),
+                    torch.tensor(distances, dtype=torch.float32))
+        return (torch.zeros(0, 4), torch.zeros(0, dtype=torch.long),
+                torch.zeros(0, dtype=torch.float32))
 
 
 def collate_fn(batch: list) -> Tuple[Tensor, List[Dict]]:

@@ -121,13 +121,16 @@ class FoveationWarpLayer(nn.Module):
         if R.dim() == 0:
             R = R.unsqueeze(0).expand(B)
 
-        source_grid = compute_source_grid(
-            H, W, o, R, self.alpha, self.p, device=image.device
-        )   # (B, H, W, 2)
+        # Newton–Raphson Φ⁻¹ uses EPS=1e-8, which underflows in fp16; compute the
+        # sampling grid in fp32 (autocast off) then cast to the image dtype.
+        with torch.autocast(device_type=image.device.type, enabled=False):
+            source_grid = compute_source_grid(
+                H, W, o.float(), R.float(), self.alpha, self.p, device=image.device
+            )   # (B, H, W, 2)
 
         return F.grid_sample(
             image,
-            source_grid,
+            source_grid.to(image.dtype),
             mode=self.mode,
             padding_mode=self.padding_mode,
             align_corners=True,
