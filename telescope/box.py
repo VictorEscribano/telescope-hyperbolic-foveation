@@ -40,25 +40,33 @@ def euclidean_to_riemannian_box(
     Returns:
         (N, 4) Riemannian boxes
     """
-    c = boxes[:, :2]           # (N, 2) box centres
-    w = boxes[:, 2:3]          # (N, 1) widths
-    h = boxes[:, 3:4]          # (N, 1) heights
+    # Geometry is numerically sensitive (EPS=1e-8 underflows to 0 in fp16,
+    # making 1/r and 1/‖·‖ overflow to inf → NaN grads).  Force fp32 and
+    # disable autocast for the whole transform.
+    with torch.autocast(device_type=boxes.device.type, enabled=False):
+        boxes = boxes.float()
+        o = o.float()
+        R = R.float() if torch.is_tensor(R) else R
 
-    phi_c = hyperbolic_foveated_transform(c, o, R, alpha, p)   # (N, 2)
-    J     = compute_jacobian(c, o, R, alpha, p)                # (N, 2, 2)
+        c = boxes[:, :2]           # (N, 2) box centres
+        w = boxes[:, 2:3]          # (N, 1) widths
+        h = boxes[:, 3:4]          # (N, 1) heights
 
-    # cat along dim=-1: (N,1)||(N,1) → (N,2)  [stack would give (N,1,2)]
-    e_x = torch.cat([w, torch.zeros_like(w)], dim=-1)          # (N, 2)
-    e_y = torch.cat([torch.zeros_like(h), h], dim=-1)          # (N, 2)
+        phi_c = hyperbolic_foveated_transform(c, o, R, alpha, p)   # (N, 2)
+        J     = compute_jacobian(c, o, R, alpha, p)                # (N, 2, 2)
 
-    # (N,2,2) @ (N,2,1) → (N,2,1) → (N,2)
-    t_x = (J @ e_x.unsqueeze(-1)).squeeze(-1)
-    t_y = (J @ e_y.unsqueeze(-1)).squeeze(-1)
+        # cat along dim=-1: (N,1)||(N,1) → (N,2)  [stack would give (N,1,2)]
+        e_x = torch.cat([w, torch.zeros_like(w)], dim=-1)          # (N, 2)
+        e_y = torch.cat([torch.zeros_like(h), h], dim=-1)          # (N, 2)
 
-    tx_norm = torch.norm(t_x, dim=-1, keepdim=True)            # (N, 1)
-    ty_norm = torch.norm(t_y, dim=-1, keepdim=True)            # (N, 1)
+        # (N,2,2) @ (N,2,1) → (N,2,1) → (N,2)
+        t_x = (J @ e_x.unsqueeze(-1)).squeeze(-1)
+        t_y = (J @ e_y.unsqueeze(-1)).squeeze(-1)
 
-    return torch.cat([phi_c, tx_norm, ty_norm], dim=-1)        # (N, 4)
+        tx_norm = torch.norm(t_x, dim=-1, keepdim=True)            # (N, 1)
+        ty_norm = torch.norm(t_y, dim=-1, keepdim=True)            # (N, 1)
+
+        return torch.cat([phi_c, tx_norm, ty_norm], dim=-1)       # (N, 4)
 
 
 def riemannian_to_euclidean_box(
@@ -83,19 +91,27 @@ def riemannian_to_euclidean_box(
     Returns:
         (N, 4) Euclidean boxes  [cx, cy, w, h]
     """
-    phi_c   = boxes_ri[:, :2]    # (N, 2)
-    tx_norm = boxes_ri[:, 2:3]   # (N, 1)
-    ty_norm = boxes_ri[:, 3:4]   # (N, 1)
+    # Geometry is numerically sensitive (EPS=1e-8 underflows to 0 in fp16,
+    # making 1/r and 1/‖·‖ overflow to inf → NaN grads).  Force fp32 and
+    # disable autocast for the whole transform.
+    with torch.autocast(device_type=boxes_ri.device.type, enabled=False):
+        boxes_ri = boxes_ri.float()
+        o = o.float()
+        R = R.float() if torch.is_tensor(R) else R
 
-    # Recover centre
-    c = hyperbolic_inverse(phi_c, o, R, alpha, p)              # (N, 2)
+        phi_c   = boxes_ri[:, :2]    # (N, 2)
+        tx_norm = boxes_ri[:, 2:3]   # (N, 1)
+        ty_norm = boxes_ri[:, 3:4]   # (N, 1)
 
-    # Recover w, h from column norms of J_Φ(c)
-    J         = compute_jacobian(c, o, R, alpha, p)            # (N, 2, 2)
-    col0_norm = torch.norm(J[:, :, 0], dim=-1, keepdim=True)   # (N, 1)
-    col1_norm = torch.norm(J[:, :, 1], dim=-1, keepdim=True)   # (N, 1)
+        # Recover centre
+        c = hyperbolic_inverse(phi_c, o, R, alpha, p)              # (N, 2)
 
-    w = tx_norm / col0_norm.clamp(min=EPS)
-    h = ty_norm / col1_norm.clamp(min=EPS)
+        # Recover w, h from column norms of J_Φ(c)
+        J         = compute_jacobian(c, o, R, alpha, p)            # (N, 2, 2)
+        col0_norm = torch.norm(J[:, :, 0], dim=-1, keepdim=True)   # (N, 1)
+        col1_norm = torch.norm(J[:, :, 1], dim=-1, keepdim=True)   # (N, 1)
 
-    return torch.cat([c, w, h], dim=-1)                        # (N, 4)
+        w = tx_norm / col0_norm.clamp(min=EPS)
+        h = ty_norm / col1_norm.clamp(min=EPS)
+
+        return torch.cat([c, w, h], dim=-1)                       # (N, 4)
