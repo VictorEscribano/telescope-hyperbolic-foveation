@@ -122,15 +122,16 @@ class Argoverse2Dataset(Dataset):
         try:
             cuboid_list = self._av2.get_labels_at_lidar_timestamp(log_id, timestamp_ns)
             cam         = self._av2.get_log_pinhole_camera(log_id, self.camera)
-            boxes_2d, labels = self._project_cuboids(
+            boxes_2d, labels, distances = self._project_cuboids(
                 cuboid_list.cuboids, cam, W_orig, H_orig
             )
         except Exception as exc:
             warnings.warn(
                 f"[Argoverse2Dataset] annotation error at {log_id}/{timestamp_ns}: {exc}"
             )
-            boxes_2d = torch.zeros(0, 4)
-            labels   = torch.zeros(0, dtype=torch.long)
+            boxes_2d  = torch.zeros(0, 4)
+            labels    = torch.zeros(0, dtype=torch.long)
+            distances = torch.zeros(0, dtype=torch.float32)
 
         # ── Normalise boxes to [-1, 1]² ───────────────────────────────────────
         if len(boxes_2d) > 0:
@@ -141,10 +142,11 @@ class Argoverse2Dataset(Dataset):
             boxes_2d[:, 3] = boxes_2d[:, 3] / H_orig * 2        # h
 
         return image, {
-            "boxes":    boxes_2d,
-            "labels":   labels,
-            "image_id": idx,
-            "log_id":   log_id,
+            "boxes":     boxes_2d,
+            "labels":    labels,
+            "distances": distances,    # (M,) metres — for per-distance-bin mAP
+            "image_id":  idx,
+            "log_id":    log_id,
             "timestamp_ns": timestamp_ns,
         }
 
@@ -155,8 +157,12 @@ class Argoverse2Dataset(Dataset):
         return TF.to_tensor(img)   # (3, H, W) in [0, 1]
 
     def _project_cuboids(self, cuboids, cam, W_orig, H_orig):
-        """Project 3D cuboids to 2D [cx, cy, w, h] boxes in pixel coords."""
-        boxes, labels = [], []
+        """Project 3D cuboids to 2D [cx, cy, w, h] boxes in pixel coords.
+
+        Returns boxes (M,4), labels (M,), and distances (M,) in metres — the
+        latter drives the per-distance-bin mAP used in the TruckDrive protocol.
+        """
+        boxes, labels, distances = [], [], []
 
         for cuboid in cuboids:
             # Filter by class
@@ -164,7 +170,7 @@ class Argoverse2Dataset(Dataset):
             if cat is None or cat not in _AV2_TO_IDX:
                 continue
 
-            # Filter by distance
+            # Range to the object (ego frame, ground-plane distance)
             dist = float(np.linalg.norm(cuboid.xyz_center_m[:2]))
             if dist > self.max_dist:
                 continue
@@ -194,11 +200,14 @@ class Argoverse2Dataset(Dataset):
 
             boxes.append([cx, cy, w, h])
             labels.append(_AV2_TO_IDX[cat])
+            distances.append(dist)
 
         if boxes:
-            return torch.tensor(boxes, dtype=torch.float32), \
-                   torch.tensor(labels, dtype=torch.long)
-        return torch.zeros(0, 4), torch.zeros(0, dtype=torch.long)
+            return (torch.tensor(boxes, dtype=torch.float32),
+                    torch.tensor(labels, dtype=torch.long),
+                    torch.tensor(distances, dtype=torch.float32))
+        return (torch.zeros(0, 4), torch.zeros(0, dtype=torch.long),
+                torch.zeros(0, dtype=torch.float32))
 
 
 def collate_fn(batch: list) -> Tuple[Tensor, List[Dict]]:

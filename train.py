@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from telescope.pipeline import TelescopeModel
 from telescope.matcher import HungarianMatcher, match_and_compute_loss, compute_denoising_loss
-from telescope.eval import CocoEvaluator, DetectionResult
+from telescope.eval import CocoEvaluator, DetectionResult, DISTANCE_BINS
 from telescope.data import Argoverse2Dataset, collate_fn, NUM_CLASSES, CLASS_NAMES
 from telescope.checkpoint import CheckpointManager
 
@@ -253,8 +253,15 @@ def main():
             metrics["loss"] = avg_loss
             elapsed = time.time() - t0
             print(f"epoch {epoch:3d}  loss={avg_loss:.4f}  "
-                  f"mAP={metrics.get('mAP_50', 0):.4f}  "
+                  f"mAP={metrics.get('mAP', 0):.4f}  "
+                  f"mAP50={metrics.get('mAP_50', 0):.4f}  "
                   f"time={elapsed:.0f}s")
+            # Per-distance-bin mAP (paper's headline metric), when available
+            dist_bins = [f"{name}={metrics[f'mAP_{name}']:.3f}"
+                         for name, _, _ in DISTANCE_BINS
+                         if f"mAP_{name}" in metrics]
+            if dist_bins:
+                print("           mAP by distance(m):  " + "  ".join(dist_bins))
             ckpt_mgr.save(
                 model if world_size == 1 else model.module,
                 optimizer, epoch, metrics, scaler

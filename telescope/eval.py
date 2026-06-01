@@ -26,7 +26,16 @@ import torch
 from torch import Tensor
 from typing import List, Dict
 
-__all__ = ["CocoEvaluator", "DetectionResult"]
+__all__ = ["CocoEvaluator", "DetectionResult", "DISTANCE_BINS"]
+
+# Per-distance-bin mAP ranges (metres) — TruckDrive / paper protocol.
+# (name, lo, hi); hi is exclusive.  Argoverse2 filters beyond ~300 m.
+DISTANCE_BINS = [
+    ("0_50",    0.0,   50.0),
+    ("50_150",  50.0,  150.0),
+    ("150_250", 150.0, 250.0),
+    ("250+",    250.0, 1e9),
+]
 
 
 try:
@@ -125,6 +134,8 @@ class CocoEvaluator:
                 gt_boxes[:, 3],
             ], dim=-1)
 
+            gt_dists = target.get("distances", None)   # (M,) metres, optional
+
             for k in range(len(target["labels"])):
                 self._ground_truth.append({
                     "id":          len(self._ground_truth) + 1,
@@ -133,6 +144,8 @@ class CocoEvaluator:
                     "bbox":        gt_xywh[k].tolist(),
                     "area":        (gt_boxes[k, 2] * gt_boxes[k, 3]).item(),
                     "iscrowd":     0,
+                    "distance":    (float(gt_dists[k]) if gt_dists is not None
+                                    and k < len(gt_dists) else -1.0),
                 })
 
     def summarize(self) -> Dict[str, float]:
@@ -170,7 +183,7 @@ class CocoEvaluator:
         evaluator.summarize()
 
         stats = evaluator.stats
-        return {
+        metrics = {
             "mAP":        float(stats[0]),   # IoU 0.50:0.95, all sizes
             "mAP_50":     float(stats[1]),   # IoU 0.50 (PASCAL)
             "mAP_75":     float(stats[2]),   # IoU 0.75
@@ -178,6 +191,48 @@ class CocoEvaluator:
             "mAP_medium": float(stats[4]),
             "mAP_large":  float(stats[5]),
         }
+
+        # ── Per-distance-bin mAP (TruckDrive protocol) ────────────────────────
+        # Only computed when GT carry real distances (Argoverse2Dataset provides
+        # them; synthetic targets default to -1 and are skipped).
+        has_dist = any(g.get("distance", -1.0) >= 0 for g in self._ground_truth)
+        if has_dist:
+            for name, lo, hi in DISTANCE_BINS:
+                res = self._eval_distance_bin(categories, images, lo, hi)
+                if res is not None:
+                    metrics[f"mAP_{name}"]    = res[0]
+                    metrics[f"mAP_50_{name}"] = res[1]
+        return metrics
+
+    def _eval_distance_bin(self, categories, images, lo: float, hi: float):
+        """COCO mAP / mAP@50 restricted to GT in distance range [lo, hi) metres.
+
+        GT outside the range are flagged ``ignore=1`` so COCOeval neither counts
+        them as misses nor penalises detections that match them — the standard
+        way to slice mAP by a per-GT attribute.  Returns (mAP, mAP_50) or None
+        if the bin has no GT.
+        """
+        import copy
+        anns = copy.deepcopy(self._ground_truth)
+        n_in = 0
+        for a in anns:
+            d = a.get("distance", -1.0)
+            in_bin = (d >= 0) and (lo <= d < hi)
+            a["ignore"] = 0 if in_bin else 1
+            n_in += int(in_bin)
+        if n_in == 0:
+            return None
+
+        coco_gt = COCO()
+        coco_gt.dataset = {"images": images, "annotations": anns,
+                           "categories": categories}
+        coco_gt.createIndex()
+        coco_dt = coco_gt.loadRes(self._predictions)
+        ev = COCOeval(coco_gt, coco_dt, "bbox")
+        ev.evaluate()
+        ev.accumulate()
+        ev.summarize()
+        return float(ev.stats[0]), float(ev.stats[1])
 
     def reset(self) -> None:
         """Clear accumulated predictions — call between epochs."""
