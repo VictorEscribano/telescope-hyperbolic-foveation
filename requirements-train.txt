@@ -10,3 +10,4 @@
 transformers>=4.40.0     # real Deformable DETR (replaces the stub decoder)
 av2>=0.3.0               # Argoverse 2 dataset loader
 pycocotools>=2.0.7       # full COCO mAP metrics (eval.py falls back without it)
+einops>=0.7.0            # required by the SAM 3 repo for the real backbone (train.py --backbone_ckpt)

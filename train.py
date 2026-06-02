@@ -306,5 +306,45 @@ def _load_sam3_backbone(model, ckpt_path, device):
     print(f"[backbone] SAM3.1 vision encoder wired ({n/1e6:.0f}M params, will be frozen)")
 
 
+def _oom_hint(args):
+    """Print an actionable message when CUDA runs out of memory.
+
+    The defaults (--batch_size 4 --image_size 1024) are paper-scale and assume a
+    12-24 GB GPU; on a smaller card the raw OutOfMemoryError traceback is unhelpful.
+    """
+    free = total = None
+    if torch.cuda.is_available():
+        try:
+            free_b, total_b = torch.cuda.mem_get_info()
+            free, total = free_b / 1e9, total_b / 1e9
+        except Exception:
+            pass
+    h, w = args.image_size
+    bar = "=" * 72
+    print(f"\n{bar}\nCUDA out of memory.")
+    print(f"  Current run : --batch_size {args.batch_size}  --image_size {h} {w}"
+          + ("  --backbone_ckpt (real SAM3.1)" if args.backbone_ckpt else "  (stub backbone)"))
+    if free is not None:
+        print(f"  GPU memory  : {free:.1f} GB free of {total:.1f} GB")
+    print("\n  The defaults (batch 4 @ 1024) are paper-scale and need a 12-24 GB GPU.")
+    print("  On a smaller GPU, try:")
+    print("    - --batch_size 1 --image_size 256 256    (smoke test, ~3 GB)")
+    print("    - --grad_accum 4                         (effective batch 4, same memory)")
+    print("    - close other GPU apps   (check with: nvidia-smi)")
+    if args.backbone_ckpt:
+        print("    - the real SAM 3.1 backbone needs ~12 GB+ no matter the batch/size;")
+        print("      drop --backbone_ckpt to smoke-test with the stub, or use a bigger GPU.")
+    print(bar)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except torch.cuda.OutOfMemoryError:
+        _oom_hint(parse_args())
+        raise SystemExit(1)
+    except RuntimeError as exc:
+        if "out of memory" in str(exc).lower():
+            _oom_hint(parse_args())
+            raise SystemExit(1)
+        raise

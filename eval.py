@@ -38,6 +38,9 @@ def parse_args():
     p.add_argument("--image_size",    type=int, nargs=2, default=[1024, 1024])
     p.add_argument("--score_threshold", type=float, default=0.05)
     p.add_argument("--fp16",          action="store_true", default=True)
+    p.add_argument("--backbone_ckpt", type=str, default=None,
+                   help="SAM3.1 checkpoint — required if the model was trained with "
+                        "the real backbone, so its weights match at load time")
     p.add_argument("--output_file",   type=str, default=None,
                    help="save results JSON to this path")
     return p.parse_args()
@@ -81,6 +84,16 @@ def main():
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = TelescopeModel(num_classes=NUM_CLASSES).to(device)
+
+    # Match the training-time architecture so the checkpoint loads: if trained
+    # with the real SAM3 backbone, rebuild it before load_state_dict (its weights
+    # are then overwritten by the checkpoint's).
+    if args.backbone_ckpt:
+        from telescope.backbone_sam3 import SAM3Backbone
+        model.backbone = SAM3Backbone(
+            checkpoint_path=args.backbone_ckpt,
+            out_channels=model.backbone.out_channels,
+        ).to(device)
 
     ckpt  = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])

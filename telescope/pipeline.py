@@ -29,7 +29,7 @@ from torch import Tensor
 from .estimator import FoveationEstimator
 from .warp import FoveationWarpLayer
 from .embedding import HyperbolicEmbedding, augment_queries
-from .head import RiemannianBoxHead, TelescopeLoss, denoise_boxes
+from .head import RiemannianBoxHead
 from .box import riemannian_to_euclidean_box
 
 __all__ = [
@@ -249,12 +249,15 @@ class RealDeformableDetr(nn.Module):
             b, c, h, w = src.shape
             spatial_shapes_list.append((h, w))
 
-            # Sine positional encoding → (B, query_dim, H_i, W_i)
+            # Sine positional encoding.  transformers<5 returns (B, C, H, W);
+            # transformers>=5 returns it already flattened to (B, H*W, C).
             pos = self.pos_emb(shape=src.shape, device=device, dtype=src.dtype)
+            if pos.dim() == 4:                          # (B, C, H, W) → (B, H*W, C)
+                pos = pos.flatten(2).permute(0, 2, 1)
 
             # Flatten spatial dims and add level embedding
             src_flat = src.flatten(2).permute(0, 2, 1)              # (B, H*W, C)
-            pos_flat = pos.flatten(2).permute(0, 2, 1) + self.level_embed[i]  # (B, H*W, C)
+            pos_flat = pos + self.level_embed[i]                    # (B, H*W, C)
 
             src_flat_list.append(src_flat)
             pos_flat_list.append(pos_flat)
@@ -345,12 +348,19 @@ class TelescopeModel(nn.Module):
         num_queries:  int = 300,
         query_dim:    int = 256,
         enc_out_dim:  int = 256,
+        low_res_size: int = 512,
     ) -> None:
         super().__init__()
 
         # ── Stage 1 ──────────────────────────────────────────────────────────
-        self.param_encoder   = SAM3EncoderStub(out_channels=enc_out_dim)
-        self.fov_estimator   = FoveationEstimator(enc_out_dim * 3, hidden=enc_out_dim)
+        # Foveation params (o, R) are estimated from the *shared* detection
+        # backbone run on a low-res, unwarped image (paper §4: "a small FFN
+        # processes encoder output from low-resolution images (256×256 or
+        # 512×512)").  No separate param encoder — sharing keeps the estimate on
+        # real SAM3 features instead of a random stub, and uses the paper's 512²
+        # rather than a 64² thumbnail.
+        self.low_res_size    = low_res_size
+        self.fov_estimator   = FoveationEstimator(query_dim * 3, hidden=enc_out_dim)
         self.warp_layer      = FoveationWarpLayer(alpha=2.0, p=2.0)
         self.hyperbolic_emb  = HyperbolicEmbedding(param_dim=4, query_dim=query_dim)
 
@@ -396,9 +406,13 @@ class TelescopeModel(nn.Module):
         """
         B = image.shape[0]
 
-        # ── Stage 1a: estimate foveation params from low-res image ────────────
-        small      = F.interpolate(image, (64, 64), mode='bilinear', align_corners=True)
-        feats_low  = self.param_encoder(small)             # 3 FPN tensors
+        # ── Stage 1a: estimate foveation params from a low-res UNWARPED image ──
+        # Uses the shared detection backbone (real SAM3 once loaded) so the
+        # estimate is driven by real encoder features at the paper's 512² — not
+        # the warped image, since the warp depends on the params we predict here.
+        small      = F.interpolate(image, (self.low_res_size, self.low_res_size),
+                                   mode='bilinear', align_corners=False)
+        feats_low  = self.backbone(small)                  # 3 FPN tensors (coarse→fine)
         # Global pool each scale and concatenate
         enc_vec    = torch.cat([f.flatten(2).mean(-1) for f in feats_low], dim=-1)  # (B, C*3)
         o, R       = self.fov_estimator(enc_vec)           # (B,2), (B,)

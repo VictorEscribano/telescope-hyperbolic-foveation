@@ -73,30 +73,86 @@ desactivado**. También se bajó `init_scale` del GradScaler a `2**13`.
 
 ---
 
-## ⏳ PENDIENTE
+## ✅ COMPLETADO — revisión pipeline vs paper (2026-06-02)
 
-### #3 — mAP por distancia (`telescope/eval.py`, `telescope/data.py`)
-La tabla estrella del paper (0–50/50–150/150–250/250 m+) NO está implementada;
-`summarize()` solo da splits por tamaño de COCO. `data.py` calcula la distancia
-solo para filtrar (`max_dist`) y la descarta. Falta: propagar la distancia por
-caja al `target`, y computar mAP por bins en `eval.py`.
+Verificado contra las ecuaciones del paper (versión HTML de arXiv) y con tests
+numéricos (round-trip, `gradcheck`, forward/backward end-to-end en GPU fp16).
+El núcleo geométrico (h, w, Φ, iteración inversa, α=p=2, caja Riemanniana, L1+gIoU,
+denoising DINO) coincide con el paper.
 
-### #4 — Gradiente de Φ⁻¹ a `o, R` (`telescope/geometry.py`)
-`HyperbolicInverseNR.backward` devuelve `None` para `o, R`: la foveación no
-aprende por el camino del warp/resampling (sí por embedding + Jacobiano del
-decode). Extender el backward con el teorema de la función implícita para
-propagar también a `o` y `R`. (Nota: con el backbone bajo `no_grad`, este camino
-no aporta a través de las features; sí aportaría vía el decode si se cierra.)
+### #3 — mAP por distancia — `telescope/eval.py`, `telescope/data.py`  ✅ (ya estaba)
+`data.py` propaga `distances` por caja al `target`; `eval.py` tiene `DISTANCE_BINS`
+(0–50/50–150/150–250/250 m+) y `_eval_distance_bin` (marca `ignore` las GT fuera del
+bin y reusa COCOeval). `train.py` imprime el desglose.
 
-### #5 — Menores (`telescope/eval.py`, `telescope/pipeline.py`)
-- Cajas en `[-1,1]`: los thresholds small/medium/large de COCO (32²/96² px) no
-  tienen sentido a esa escala (todo cae en "small").
-- La estimación de parámetros usa 64×64 (`pipeline.py` Stage 1a); el paper/docstring
-  dicen 256/512.
+### #4 — Gradiente de Φ⁻¹ a `o, R` — `telescope/geometry.py`
+`HyperbolicInverseNR.backward` ahora propaga a `o,R` por el teorema de la función
+implícita: con `g = J_x⁻ᵀ·dL/dx*`, devuelve `dL/do = −Φ_oᵀ·g`, `dL/dR = −Φ_Rᵀ·g`
+(VJP por autograd a través de Φ en el punto fijo). Verificado con `gradcheck` (doble
+precisión); el warp ya pasa gradiente a `o,R` (antes `None`). Nota: con el backbone
+real bajo `no_grad` (memoria), el camino warp→features sigue cortado; la señal a
+`o,R` llega por el decode (ahora vía centre-inversion además del Jacobiano).
+
+### #5 (resolución/features) — estimador de foveación — `telescope/pipeline.py`
+Ya no usa un `SAM3EncoderStub` aleatorio separado a 64²: usa el **backbone
+compartido** (SAM3 real cuando se carga) sobre la imagen sin deformar a **512²**
+(paper: 256/512). Eliminado `param_encoder`; `fov_estimator` toma `query_dim*3`.
+Notebook 05 actualizado. (Coste: el backbone corre 2× por step; bajo `no_grad` el
+pico de memoria no se acumula.)
+
+### #6 — `RealDeformableDetr` incompatible con `transformers` 5.x — `telescope/pipeline.py`
+En `transformers≥5`, `DeformableDetrSinePositionEmbedding` ya devuelve `(B,H*W,C)`;
+el código lo re-aplanaba y reventaba en el primer forward (`__init__` solo captura
+`ImportError`, así que no caía al stub → el entrenamiento abortaba). Ahora `encode`
+detecta `pos.dim()==4` y solo aplana en la API vieja. Verificado con 5.6.2.
+
+### #7 — clasificación sin ponderar fondo — `telescope/matcher.py`
+`match_and_compute_loss` usa `eos_coef=0.1` (estilo DETR) para que el fondo no
+domine la cross-entropy de las queries.
+
+### #8 — `eval.py`/`compare.py` — `eval.py`, `compare.py`
+`eval.py --backbone_ckpt`: reconstruye `SAM3Backbone` antes de `load_state_dict`
+(si no, las claves no casan al evaluar un modelo entrenado con el backbone real).
+`compare.py` usa las claves de bins de distancia reales (`mAP_0_50`, …).
 
 ---
 
+## ⏳ PENDIENTE
+
+### Thresholds de tamaño COCO en `[-1,1]` — `telescope/eval.py`
+Los splits small/medium/large de COCO (32²/96² px) no tienen sentido con cajas en
+`[-1,1]` (todo cae en "small"). Los bins por distancia son la métrica del paper y
+sí funcionan; los de tamaño son ruido informativo.
+
+### Warp→features con backbone real congelado — `telescope/backbone_sam3.py`
+Para que la foveación aprenda por el re-muestreo (señal STN completa) haría falta no
+envolver el backbone congelado en `no_grad` — cuesta memoria (activaciones del ViT).
+Tradeoff abierto: memoria vs señal del warp a `o,R`.
+
+---
+
+## Verificación end-to-end con datos reales (2026-06-02)
+
+Tras descargar Argoverse 2 (subset 5 train + 5 val, ~10 GB) e instalar los extras:
+
+- **Anotaciones reales cargan → `matched>0`.** 783 frames en val; las cajas se
+  proyectan con distancias (16–126 m) y clases correctas. El bug original
+  `matched=0` está confirmado muerto sobre datos reales (no solo sintéticos).
+- **Bucle de entrenamiento completo OK sobre datos reales:** loss baja
+  (12.6→10.6), `matched` = nº de GT cada paso, `fov_estimator` recibe gradiente.
+  Verificado con el **stub** a 256² batch 1 (pico 3.0 GB).
+- **Backbone SAM 3.1 real carga** (438 pesos vision, ignora 36 del neck SAM2) y el
+  Deformable DETR real se construye con **`transformers` 5.9** (el fix del
+  pos-embed #6 funciona). Pero **da OOM a 1024/640/512** en esta GPU (ver abajo).
+- **`einops` faltaba en el venv** (lo importa el repo `sam3`): añadido a
+  `requirements-train.txt`.
+
 ## Notas de verificación / entorno
-- GPU del entorno: **12 GB** (el README dice 14 GB). Backbone real cabe con batch 2.
-- `flash_attn` NO instalado; SAM3 corre con SDPA (`use_fa3=False`). Se instaló `einops`.
+- **Máquina actual: GPU de 8 GB** (RTX 3070 Ti Laptop), con DaVinci Resolve
+  ocupando ~3.4 GB → el backbone SAM 3.1 real **no cabe** (OOM a cualquier
+  resolución; el ViT corre a 1008² fijo). Entrenar fiel al paper requiere
+  **12 GB+** (la nota previa de "12 GB, batch 2" era de otra máquina).
+- `flash_attn` NO instalado; SAM3 corre con SDPA (`use_fa3=False`).
 - El backbone real requiere `query_dim=256` (d_model del neck SAM3).
+- En esta máquina solo caben smoke tests (stub, ≤256², batch 1); las cifras del
+  paper requieren GPU 12 GB+ y el split completo (Argoverse2 ≠ TruckDrive).
