@@ -32,10 +32,13 @@ def parse_args():
 
 
 METRICS_TO_PLOT = ["mAP_50", "mAP", "mAP_75"]
+# Real per-distance-bin keys produced by telescope.eval (TruckDrive protocol).
+# Missing keys fall back to 0 in _bar_panel, so this is safe on older results.
 DISTANCE_METRICS = {
-    "0–50 m":   "mAP_small",    # proxy — replace with distance-bin keys if available
-    "50–150 m": "mAP_medium",
-    ">150 m":   "mAP_large",
+    "0–50 m":    "mAP_0_50",
+    "50–150 m":  "mAP_50_150",
+    "150–250 m": "mAP_150_250",
+    "≥250 m":    "mAP_250+",
 }
 
 COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52"]

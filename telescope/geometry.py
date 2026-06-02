@@ -168,7 +168,9 @@ class HyperbolicInverseNR(torch.autograd.Function):
     """Differentiable Φ⁻¹ via Newton-Raphson + implicit-function-theorem backward.
 
     Forward  : NR iteration x^{k+1} = x^k + η(y − Φ(x^k)) inside no_grad().
-    Backward : dL/dy = J_Φ(x*)^{−T} · dL/dx*   (one 2×2 solve per point).
+    Backward : dL/dy = J_Φ(x*)^{−T}·dL/dx*, and (via the implicit function
+               theorem) dL/do = −Φ_o^T·g, dL/dR = −Φ_R^T·g with g = dL/dy —
+               so gradients flow to the foveation params, not only to y.
 
     This is the "fixed-point differentiation" trick used in Deep Equilibrium
     Models: the backward is exact regardless of how many NR steps the forward took.
@@ -206,9 +208,35 @@ class HyperbolicInverseNR(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor):
         x_star, o, R = ctx.saved_tensors
-        J = compute_jacobian(x_star, o, R, ctx.alpha, ctx.p)
-        grad_y = torch.linalg.solve(J.mT, grad_output.unsqueeze(-1)).squeeze(-1)
-        return grad_y, None, None, None, None, None, None, None
+        alpha, p = ctx.alpha, ctx.p
+
+        # Implicit-function-theorem backward on the fixed point  y = Φ(x*; o, R).
+        # Differentiating  J_x·dx* + Φ_o·do + Φ_R·dR = dy  and writing
+        # g := J_x^{-T}·(dL/dx*)  gives the three vector-Jacobian products:
+        #     dL/dy = g,   dL/do = -Φ_o^T·g,   dL/dR = -Φ_R^T·g
+        # so the inverse is differentiable w.r.t. the foveation params (o, R),
+        # not only y (Telescope paper §3.1: "the inverse ... admits
+        # backpropagation through foveation parameters (o, R)").
+        J = compute_jacobian(x_star, o, R, alpha, p)
+        g = torch.linalg.solve(J.mT, grad_output.unsqueeze(-1)).squeeze(-1)   # = dL/dy
+
+        grad_o = grad_R = None
+        if ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
+            # -Φ_o^T·g and -Φ_R^T·g via a single autograd VJP through Φ evaluated
+            # at the fixed point (x* held constant).  Cheap: one forward of Φ.
+            with torch.enable_grad():
+                o_ = o.detach().requires_grad_(True)
+                R_ = R.detach().requires_grad_(True)
+                y_pred = hyperbolic_foveated_transform(x_star.detach(), o_, R_, alpha, p)
+                grad_o, grad_R = torch.autograd.grad(
+                    y_pred, (o_, R_), grad_outputs=-g, allow_unused=True,
+                )
+            if not ctx.needs_input_grad[1]:
+                grad_o = None
+            if not ctx.needs_input_grad[2]:
+                grad_R = None
+
+        return g, grad_o, grad_R, None, None, None, None, None
 
 
 def hyperbolic_inverse(

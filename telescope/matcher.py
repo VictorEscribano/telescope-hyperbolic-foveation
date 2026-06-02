@@ -124,6 +124,7 @@ def match_and_compute_loss(
     lambda_l1:        float = 5.0,
     lambda_giou:      float = 2.0,
     lambda_cls:       float = 1.0,
+    eos_coef:         float = 0.1,
 ) -> dict:
     """Full loss computation with Hungarian matching for a batch.
 
@@ -143,6 +144,11 @@ def match_and_compute_loss(
 
     B, Q, _ = pred_boxes_ri.shape
     bg_class = num_classes - 1   # background = last class index
+
+    # Down-weight the no-object class (DETR eos_coef): most of the Q queries match
+    # background, so without this the CE collapses to always predicting "no object".
+    cls_weight = pred_logits.new_ones(num_classes)
+    cls_weight[bg_class] = eos_coef
 
     total_l1   = pred_boxes_ri.new_zeros(1)
     total_giou = pred_boxes_ri.new_zeros(1)
@@ -165,7 +171,8 @@ def match_and_compute_loss(
         target_labels = torch.full((Q,), bg_class, dtype=torch.long,
                                     device=pred_logits.device)
         target_labels[pred_idx] = lbl_b[gt_idx]
-        total_cls = total_cls + F.cross_entropy(pred_logits[b], target_labels)
+        total_cls = total_cls + F.cross_entropy(pred_logits[b], target_labels,
+                                                weight=cls_weight)
 
         if len(pred_idx) == 0:
             continue
