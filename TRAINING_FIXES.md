@@ -131,7 +131,28 @@ Tradeoff abierto: memoria vs señal del warp a `o,R`.
 
 ---
 
+## Verificación end-to-end con datos reales (2026-06-02)
+
+Tras descargar Argoverse 2 (subset 5 train + 5 val, ~10 GB) e instalar los extras:
+
+- **Anotaciones reales cargan → `matched>0`.** 783 frames en val; las cajas se
+  proyectan con distancias (16–126 m) y clases correctas. El bug original
+  `matched=0` está confirmado muerto sobre datos reales (no solo sintéticos).
+- **Bucle de entrenamiento completo OK sobre datos reales:** loss baja
+  (12.6→10.6), `matched` = nº de GT cada paso, `fov_estimator` recibe gradiente.
+  Verificado con el **stub** a 256² batch 1 (pico 3.0 GB).
+- **Backbone SAM 3.1 real carga** (438 pesos vision, ignora 36 del neck SAM2) y el
+  Deformable DETR real se construye con **`transformers` 5.9** (el fix del
+  pos-embed #6 funciona). Pero **da OOM a 1024/640/512** en esta GPU (ver abajo).
+- **`einops` faltaba en el venv** (lo importa el repo `sam3`): añadido a
+  `requirements-train.txt`.
+
 ## Notas de verificación / entorno
-- GPU del entorno: **12 GB** (el README dice 14 GB). Backbone real cabe con batch 2.
-- `flash_attn` NO instalado; SAM3 corre con SDPA (`use_fa3=False`). Se instaló `einops`.
+- **Máquina actual: GPU de 8 GB** (RTX 3070 Ti Laptop), con DaVinci Resolve
+  ocupando ~3.4 GB → el backbone SAM 3.1 real **no cabe** (OOM a cualquier
+  resolución; el ViT corre a 1008² fijo). Entrenar fiel al paper requiere
+  **12 GB+** (la nota previa de "12 GB, batch 2" era de otra máquina).
+- `flash_attn` NO instalado; SAM3 corre con SDPA (`use_fa3=False`).
 - El backbone real requiere `query_dim=256` (d_model del neck SAM3).
+- En esta máquina solo caben smoke tests (stub, ≤256², batch 1); las cifras del
+  paper requieren GPU 12 GB+ y el split completo (Argoverse2 ≠ TruckDrive).
