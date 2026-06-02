@@ -146,6 +146,13 @@ Tras descargar Argoverse 2 (subset 5 train + 5 val, ~10 GB) e instalar los extra
   pos-embed #6 funciona). Pero **da OOM a 1024/640/512** en esta GPU (ver abajo).
 - **`einops` faltaba en el venv** (lo importa el repo `sam3`): añadido a
   `requirements-train.txt`.
+- **Prueba de corrección por overfitting:** con el backbone *entrenable* y 2 frames de
+  objetos grandes/cercanos, el modelo sobreajusta a **`mAP50 = 1.000`** (loss 2.6→0.43).
+  Como `mAP50` pasa de 0 → 1.0, queda probado que el camino warp→DETR→Riemann→Φ⁻¹→
+  matching→pérdida **localiza correctamente, sin bug**. El `mAP≈0` del entrenamiento real
+  es solo el setup débil (stub congelado + 5 logs + pocas épocas + 256 px), no un error de
+  código. (Un primer overfit dio mAP50 bajo por dos *confounds*: 28 objetos/frame muchos a
+  100 m+ = 2-3 px a 256 px, y el stub **congelado**; al quitarlos → 1.0.)
 
 ## Notas de verificación / entorno
 - **Máquina actual: GPU de 8 GB** (RTX 3070 Ti Laptop), con DaVinci Resolve
