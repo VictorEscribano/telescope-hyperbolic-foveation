@@ -126,6 +126,22 @@ python train.py \
     --fp16
 ```
 
+### Smaller GPU / smoke test (< 12 GB)
+
+The defaults are paper-scale (real backbone, 1024 px, batch 4) and want 12–24 GB.
+To check the pipeline runs end-to-end on a small GPU (stub backbone, ~3 GB VRAM):
+
+```bash
+python train.py \
+    --data_dir ./data/argoverse2/sensor/train \
+    --val_dir  ./data/argoverse2/sensor/val \
+    --batch_size 1 --image_size 256 256 --fp16
+```
+
+This is a functional check, not a quality run: without the real SAM 3.1 backbone
+and the full dataset, mAP stays near zero (expected, not a bug). `train.py` prints
+these flags as a hint if it hits CUDA OOM.
+
 ### 2× GPU — DDP (server with 2× 24 GB)
 
 ```bash

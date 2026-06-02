@@ -20,6 +20,7 @@ sam2/
 
 # ── Training outputs ──────────────────────────────────────────────────
 runs/
+overfit_viz/
 *.log
 
 # ── The paper PDF (large; available on arXiv) ─────────────────────────
