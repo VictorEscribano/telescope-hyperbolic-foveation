@@ -41,6 +41,10 @@ def parse_args():
     p.add_argument("--backbone_ckpt", type=str, default=None,
                    help="SAM3.1 checkpoint — required if the model was trained with "
                         "the real backbone, so its weights match at load time")
+    p.add_argument("--two_stage",    dest="two_stage", action="store_true", default=True,
+                   help="build the DINO two-stage head (default; must match training)")
+    p.add_argument("--no_two_stage", dest="two_stage", action="store_false",
+                   help="build the one-stage head — use for checkpoints trained with --no_two_stage")
     p.add_argument("--output_file",   type=str, default=None,
                    help="save results JSON to this path")
     return p.parse_args()
@@ -83,7 +87,7 @@ def main():
     print(f"Device: {device}")
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = TelescopeModel(num_classes=NUM_CLASSES).to(device)
+    model = TelescopeModel(num_classes=NUM_CLASSES, two_stage=args.two_stage).to(device)
 
     # Match the training-time architecture so the checkpoint loads: if trained
     # with the real SAM3 backbone, rebuild it before load_state_dict (its weights

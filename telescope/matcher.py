@@ -22,7 +22,8 @@ from scipy.optimize import linear_sum_assignment
 from .box import riemannian_to_euclidean_box
 from .head import generalized_box_iou
 
-__all__ = ["HungarianMatcher", "match_and_compute_loss", "compute_denoising_loss"]
+__all__ = ["HungarianMatcher", "match_and_compute_loss", "compute_denoising_loss",
+           "compute_encoder_aux_loss"]
 
 
 class HungarianMatcher:
@@ -219,19 +220,22 @@ def compute_denoising_loss(
     lambda_giou:      float = 2.0,
     lambda_cls:       float = 1.0,
 ) -> dict:
-    """DINO-style denoising loss (no Hungarian matching).
+    """DINO-style denoising loss (no Hungarian matching), in Riemannian space.
 
     Each denoising query corresponds 1-to-1 to a GT box, so we supervise it
-    directly: decode the predicted Riemannian box to Euclidean and apply the
-    same L1 + gIoU + classification losses against its GT.  This gives a dense,
-    stable training signal that accelerates convergence (Telescope paper §4).
+    directly.  Paper Appendix E: the noised GT is projected to the Riemannian
+    space so the denoising boxes "remain in the same space as the network
+    predictions".  We therefore project the *clean* GT to Riemannian via the
+    forward Φ (no NR inverse) and compute L1 + gIoU against the predicted
+    Riemannian boxes directly — keeping the loss in the warped frame where
+    distant objects keep their magnified scale (the point of the foveation).
 
     Args:
         dn_out : dict with 'boxes_ri' (B,M,4), 'logits' (B,M,C), 'mask' (B,M)
     Returns:
         dict with loss_dn, loss_dn_l1, loss_dn_giou, loss_dn_cls, n_dn
     """
-    from .box import riemannian_to_euclidean_box
+    from .box import euclidean_to_riemannian_box
     from .head import generalized_box_iou
 
     boxes_ri = dn_out["boxes_ri"]    # (B, M, 4)
@@ -248,12 +252,16 @@ def compute_denoising_loss(
         m = int(mask[b].sum())
         if m == 0:
             continue
-        gt  = gt_boxes_list[b].to(boxes_ri.device)[:m]    # (m, 4)
+        gt  = gt_boxes_list[b].to(boxes_ri.device)[:m]    # (m, 4) Euclidean
         lbl = gt_labels_list[b].to(logits.device)[:m]     # (m,)
 
-        pred_eu = riemannian_to_euclidean_box(boxes_ri[b, :m], o[b], R[b], alpha, p)
-        total_l1   = total_l1   + F.l1_loss(pred_eu, gt)
-        total_giou = total_giou + (1.0 - generalized_box_iou(pred_eu, gt)).mean()
+        # Clean GT → Riemannian target (forward Φ only); compare to predictions
+        # in the warped frame.  [Φ(cx),Φ(cy),‖tx‖,‖ty‖] is a valid [cx,cy,w,h]
+        # box there, so L1 + gIoU apply unchanged.
+        gt_ri   = euclidean_to_riemannian_box(gt, o[b], R[b], alpha, p)
+        pred_ri = boxes_ri[b, :m]
+        total_l1   = total_l1   + F.l1_loss(pred_ri, gt_ri)
+        total_giou = total_giou + (1.0 - generalized_box_iou(pred_ri, gt_ri)).mean()
         total_cls  = total_cls  + F.cross_entropy(logits[b, :m], lbl)
         n_dn += m
 
@@ -270,3 +278,99 @@ def compute_denoising_loss(
         loss_dn_cls=loss_cls,
         n_dn=n_dn,
     )
+
+
+def _sigmoid_focal(logits: Tensor, targets: Tensor,
+                   alpha: float = 0.25, gamma: float = 2.0) -> Tensor:
+    """Sigmoid focal loss (Lin et al. 2017), mean-reduced.
+
+    Used for the class-agnostic encoder objectness, where positives (~tens of
+    matched proposals) are swamped by negatives (~tens of thousands of tokens);
+    focal down-weights the easy negatives so the rare positives still train.
+    """
+    p  = logits.sigmoid()
+    ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p_t = p * targets + (1 - p) * (1 - targets)
+    loss = ce * ((1 - p_t) ** gamma)
+    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    return (alpha_t * loss).mean()
+
+
+def compute_encoder_aux_loss(
+    enc_class:      Tensor,    # (B, S, 1) per-token objectness logits
+    enc_coord:      Tensor,    # (B, S, 4) per-token box logits (inverse-sigmoid)
+    gt_boxes_list:  list,      # list of (M_b, 4) Euclidean GT boxes in [-1, 1]
+    gt_labels_list: list,      # unused — objectness is class-agnostic (API parity)
+    o:              Tensor,    # (B, 2)
+    R:              Tensor,    # (B,)
+    alpha:          float = 2.0,
+    p:              float = 2.0,
+    lambda_l1:      float = 5.0,
+    lambda_giou:    float = 2.0,
+    lambda_obj:     float = 1.0,
+) -> dict:
+    """Two-stage encoder auxiliary loss for DINO-style query selection.
+
+    Supervises the per-token objectness + box proposals so the top-k selection
+    in ``TelescopeModel.select_queries`` is meaningful (without it the objectness
+    ranking that drives selection never trains, and two-stage underperforms the
+    one-stage path).  Computed entirely in the warped ``[0,1]`` frame: GT is
+    projected to Riemannian via Φ then rescaled ``[-1,1] → [0,1]`` so it matches
+    the encoder features, which are extracted from the warped image.
+
+    The matcher runs over *all* encoder tokens (standard Deformable DETR
+    two-stage), so the GT-closest token gets matched regardless of its current
+    (possibly random-init) objectness — which is what lets objectness bootstrap.
+    """
+    from .box import euclidean_to_riemannian_box
+    from .head import generalized_box_iou
+
+    B = enc_class.shape[0]
+    total_l1   = enc_class.new_zeros(1)
+    total_giou = enc_class.new_zeros(1)
+    total_obj  = enc_class.new_zeros(1)
+    n_enc = 0
+
+    for b in range(B):
+        obj_logits = enc_class[b, :, 0]                  # (S,)
+        boxes01    = enc_coord[b].sigmoid()              # (S, 4) [cx,cy,w,h] in [0,1]
+        gt         = gt_boxes_list[b].to(enc_class.device)
+
+        if gt.shape[0] == 0:
+            total_obj = total_obj + _sigmoid_focal(obj_logits, torch.zeros_like(obj_logits))
+            continue
+
+        # GT → Riemannian (warped [-1,1]) → normalised [0,1] box.
+        gt_ri = euclidean_to_riemannian_box(gt, o[b], R[b], alpha, p)
+        gt01  = torch.cat([(gt_ri[:, :2] + 1.0) * 0.5, gt_ri[:, 2:] * 0.5],
+                          dim=-1).clamp(0.0, 1.0)         # (M, 4)
+
+        # Hungarian match (objectness + L1 + gIoU) over all tokens, no-grad.
+        with torch.no_grad():
+            S, M = boxes01.shape[0], gt01.shape[0]
+            cost_obj = -obj_logits.sigmoid().unsqueeze(1).expand(-1, M)          # (S,M)
+            cost_l1  = torch.cdist(boxes01, gt01, p=1)                           # (S,M)
+            giou = generalized_box_iou(
+                boxes01.unsqueeze(1).expand(-1, M, -1).reshape(-1, 4),
+                gt01.unsqueeze(0).expand(S, -1, -1).reshape(-1, 4),
+            ).reshape(S, M)
+            C = (lambda_obj * cost_obj + lambda_l1 * cost_l1 - lambda_giou * giou)
+            pred_idx, gt_idx = linear_sum_assignment(C.cpu().numpy())
+            pred_idx = torch.as_tensor(pred_idx, dtype=torch.long, device=enc_class.device)
+            gt_idx   = torch.as_tensor(gt_idx,   dtype=torch.long, device=enc_class.device)
+
+        # Objectness focal loss over all tokens (1 = matched, 0 elsewhere).
+        obj_target = torch.zeros_like(obj_logits)
+        obj_target[pred_idx] = 1.0
+        total_obj = total_obj + _sigmoid_focal(obj_logits, obj_target)
+
+        # Box L1 + gIoU on matched proposals only.
+        pb, gb = boxes01[pred_idx], gt01[gt_idx]
+        total_l1   = total_l1   + F.l1_loss(pb, gb)
+        total_giou = total_giou + (1.0 - generalized_box_iou(pb, gb)).mean()
+        n_enc += len(pred_idx)
+
+    denom    = max(B, 1)
+    loss_enc = (lambda_l1 * total_l1 + lambda_giou * total_giou
+                + lambda_obj * total_obj) / denom
+    return dict(loss_enc=loss_enc, n_enc=n_enc)

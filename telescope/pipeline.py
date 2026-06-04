@@ -21,6 +21,8 @@ lightweight stubs so the full pipeline can be tested without GPU-heavy
 weights.  See README.md for instructions on substituting real weights.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,6 +33,7 @@ from .warp import FoveationWarpLayer
 from .embedding import HyperbolicEmbedding, augment_queries
 from .head import RiemannianBoxHead
 from .box import riemannian_to_euclidean_box
+from .geometry import hyperbolic_foveated_transform
 
 __all__ = [
     "SAM3EncoderStub",
@@ -185,6 +188,7 @@ class RealDeformableDetr(nn.Module):
         query_dim:          int = 256,
         num_queries:        int = 300,
         num_feature_levels: int = 2,
+        two_stage:          bool = True,
     ) -> None:
         super().__init__()
         from transformers import DeformableDetrConfig
@@ -196,7 +200,13 @@ class RealDeformableDetr(nn.Module):
 
         self.num_feature_levels = num_feature_levels
         self.query_dim          = query_dim
+        self.two_stage          = two_stage
+        self.num_queries        = num_queries
 
+        # We drive query selection ourselves (see select_queries), so the HF
+        # config stays two_stage=False — we use the bare encoder/decoder and
+        # add the two-stage proposal machinery below.  This keeps the
+        # encode/decode split that the denoising pass reuses.
         cfg = DeformableDetrConfig(
             d_model             = query_dim,
             encoder_layers      = 6,
@@ -230,7 +240,25 @@ class RealDeformableDetr(nn.Module):
 
         # Projects augmented query content to (cx, cy) reference points in [0,1].
         # The decoder internally expands these to all FPN levels via valid_ratios.
+        # Used only on the one-stage path (when two_stage=False or for the stub).
         self.ref_pts  = nn.Linear(query_dim, 2)
+
+        # ── Two-stage query selection (paper Table 9: "DINO 2-Stage") ─────────
+        # Mirrors Deformable DETR's two-stage block, but applied to our SAM3
+        # encoder memory.  The proposal heads are supervised by an auxiliary
+        # encoder loss at train time (telescope.matcher.compute_encoder_aux_loss);
+        # without it the objectness ranking that drives top-k would never learn.
+        if two_stage:
+            self.enc_output      = nn.Linear(query_dim, query_dim)
+            self.enc_output_norm = nn.LayerNorm(query_dim)
+            self.pos_trans       = nn.Linear(query_dim * 2, query_dim * 2)
+            self.pos_trans_norm  = nn.LayerNorm(query_dim * 2)
+            self.enc_class_head  = nn.Linear(query_dim, 1)               # objectness
+            self.enc_bbox_head   = nn.Sequential(                        # box deltas
+                nn.Linear(query_dim, query_dim), nn.ReLU(),
+                nn.Linear(query_dim, query_dim), nn.ReLU(),
+                nn.Linear(query_dim, 4),
+            )
 
     def encode(self, features: list) -> dict:
         """Run the deformable encoder once and return a reusable context.
@@ -291,17 +319,22 @@ class RealDeformableDetr(nn.Module):
         }
 
     def decode(self, ctx: dict, queries: Tensor,
-               reference_points: Tensor = None) -> Tensor:
+               reference_points: Tensor = None, query_pos: Tensor = None) -> Tensor:
         """Run the deformable decoder against a pre-computed encoder context.
 
         Args:
             ctx              : output of :meth:`encode`
             queries          : (B, Q, query_dim) object/denoising queries
-            reference_points : (B, Q, 2) in [0,1].  If given (denoising), used
-                               directly; else predicted from query content.
+            reference_points : (B, Q, 2) or (B, Q, 4) in [0,1].  If given
+                               (denoising / two-stage), used directly; else
+                               predicted from query content (one-stage).
+            query_pos        : (B, Q, query_dim) decoder position embeddings
+                               (two-stage proposal embeddings); ``None`` on the
+                               one-stage path, where foveation context already
+                               lives inside ``queries``.
         """
-        # Reference points (cx, cy) ∈ [0,1].  Normally derived from query content;
-        # for DINO-style denoising the caller supplies the noised GT centres.
+        # Reference points ∈ [0,1].  Normally derived from query content; for
+        # DINO denoising and two-stage selection the caller supplies them.
         if reference_points is None:
             ref_pts = self.ref_pts(queries).sigmoid()   # (B, Q, 2)
         else:
@@ -309,7 +342,7 @@ class RealDeformableDetr(nn.Module):
 
         return self.decoder(
             inputs_embeds                       = queries,
-            object_queries_position_embeddings  = None,   # foveation emb. already in queries
+            object_queries_position_embeddings  = query_pos,
             encoder_hidden_states               = ctx["enc_out"],
             reference_points                    = ref_pts,
             spatial_shapes                      = ctx["spatial_shapes"],
@@ -317,6 +350,70 @@ class RealDeformableDetr(nn.Module):
             level_start_index                   = ctx["level_start_index"],
             valid_ratios                        = ctx["valid_ratios"],
         ).last_hidden_state                          # (B, Q, C)
+
+    # ── Two-stage query selection ─────────────────────────────────────────────
+    def _get_proposal_pos_embed(self, proposals: Tensor) -> Tensor:
+        """Sine position embedding of 4-D proposals (cf. Deformable DETR)."""
+        num_pos_feats = self.query_dim // 2
+        temperature   = 10000
+        scale         = 2 * math.pi
+        dtype         = proposals.dtype
+        dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=proposals.device)
+        dim_t = temperature ** (2 * torch.div(dim_t, 2, rounding_mode="floor") / num_pos_feats)
+        prop  = proposals.sigmoid().to(torch.float32) * scale          # (B,Q,4)
+        pos   = prop[:, :, :, None] / dim_t                            # (B,Q,4,nf)
+        pos   = torch.stack((pos[:, :, :, 0::2].sin(), pos[:, :, :, 1::2].cos()), dim=4).flatten(2)
+        return pos.to(dtype)                                           # (B,Q,2*query_dim)
+
+    def _gen_proposals(self, enc_out: Tensor, spatial_shapes_list) -> tuple:
+        """Grid anchor proposals + projected object-query features (no padding)."""
+        B = enc_out.shape[0]
+        proposals = []
+        for level, (H, W) in enumerate(spatial_shapes_list):
+            grid_y, grid_x = torch.meshgrid(
+                torch.linspace(0, H - 1, H, dtype=enc_out.dtype, device=enc_out.device),
+                torch.linspace(0, W - 1, W, dtype=enc_out.dtype, device=enc_out.device),
+                indexing="ij",
+            )
+            grid  = torch.stack([grid_x, grid_y], dim=-1)              # (H,W,2)
+            grid  = (grid.reshape(1, -1, 2).expand(B, -1, -1) + 0.5)
+            grid  = grid / grid.new_tensor([W, H])                     # normalise to (0,1)
+            wh    = torch.ones_like(grid) * 0.05 * (2.0 ** level)
+            proposals.append(torch.cat([grid, wh], dim=-1))           # (B,H*W,4)
+        output_proposals = torch.cat(proposals, dim=1)                # (B,S,4)
+        valid = ((output_proposals > 0.01) & (output_proposals < 0.99)).all(-1, keepdim=True)
+        output_proposals = torch.log(output_proposals / (1 - output_proposals))  # inverse sigmoid
+        output_proposals = output_proposals.masked_fill(~valid, float("inf"))
+        object_query = enc_out.masked_fill(~valid, 0.0)
+        object_query = self.enc_output_norm(self.enc_output(object_query))
+        return object_query, output_proposals
+
+    def select_queries(self, ctx: dict) -> dict:
+        """Pick the top-k encoder proposals as decoder queries (two-stage).
+
+        Returns the selected query content/position embeddings and 4-D
+        reference points, plus the *full* per-token proposal class/coord logits
+        so the training loop can supervise them (compute_encoder_aux_loss).
+        """
+        enc_out = ctx["enc_out"]                                      # (B,S,C)
+        object_query, output_proposals = self._gen_proposals(enc_out, ctx["spatial_shapes_list"])
+        enc_class = self.enc_class_head(object_query)                # (B,S,1) objectness
+        enc_coord = self.enc_bbox_head(object_query) + output_proposals  # (B,S,4) inv-sigmoid
+
+        topk = min(self.num_queries, enc_class.shape[1])
+        topk_idx    = torch.topk(enc_class[..., 0], topk, dim=1)[1]   # (B,topk)
+        topk_coords = torch.gather(enc_coord, 1, topk_idx.unsqueeze(-1).expand(-1, -1, 4)).detach()
+        ref_points  = topk_coords.sigmoid()                          # (B,topk,4) ∈ [0,1]
+
+        pos = self.pos_trans_norm(self.pos_trans(self._get_proposal_pos_embed(topk_coords)))
+        query_pos, target = torch.split(pos, self.query_dim, dim=2)   # (B,topk,C) each
+        return {
+            "target":     target,        # decoder query content
+            "query_pos":  query_pos,      # decoder query position embedding
+            "ref_points": ref_points,     # 4-D reference boxes
+            "enc_class":  enc_class,      # (B,S,1) for the auxiliary loss
+            "enc_coord":  enc_coord,      # (B,S,4) for the auxiliary loss
+        }
 
     def forward(self, features: list, queries: Tensor,
                 reference_points: Tensor = None) -> Tensor:
@@ -349,6 +446,7 @@ class TelescopeModel(nn.Module):
         query_dim:    int = 256,
         enc_out_dim:  int = 256,
         low_res_size: int = 512,
+        two_stage:    bool = True,
     ) -> None:
         super().__init__()
 
@@ -367,11 +465,15 @@ class TelescopeModel(nn.Module):
         # ── Stage 2a ─────────────────────────────────────────────────────────
         self.backbone = SAM3EncoderStub(out_channels=query_dim)
         try:
-            self.detr = RealDeformableDetr(query_dim, num_queries)
-            print("[telescope] Using real Deformable DETR (transformers)")
+            self.detr = RealDeformableDetr(query_dim, num_queries, two_stage=two_stage)
+            print(f"[telescope] Using real Deformable DETR (transformers), "
+                  f"two_stage={two_stage}")
         except ImportError:
             self.detr = DeformableDetrStub(query_dim, num_queries)
             print("[telescope] transformers not found — using DeformableDetrStub")
+        # Two-stage derives queries from encoder proposals; the one-stage path
+        # (stub, or --no_two_stage) uses these learned object queries instead.
+        self.two_stage      = two_stage and isinstance(self.detr, RealDeformableDetr)
         self.object_queries = nn.Embedding(num_queries, query_dim)
 
         # DINO-style denoising: per-class content embedding for noised GT queries.
@@ -403,6 +505,9 @@ class TelescopeModel(nn.Module):
             o, R        : foveation parameters (for loss / logging)
             boxes_ri    : (B, num_queries, 4) Riemannian b'  [only if return_riemannian]
             dn_out      : dict with denoising preds      [only if denoising given]
+            enc_outputs : (enc_class, enc_coord) two-stage proposal logits for the
+                          encoder auxiliary loss, or None when one-stage
+                          [last element of any return_riemannian tuple]
         """
         B = image.shape[0]
 
@@ -426,16 +531,30 @@ class TelescopeModel(nn.Module):
         # ── Stage 1b: warp full-resolution image ──────────────────────────────
         warped     = self.warp_layer(image, o, R)          # (B, 3, H, W)
 
-        # ── Stage 1c: hyperbolic embedding → augment queries ─────────────────
+        # ── Stage 1c: hyperbolic embedding ────────────────────────────────────
         fov_params  = torch.cat([o, R.unsqueeze(-1).expand(-1, 2)], dim=-1)  # (B,4)
         embedding   = self.hyperbolic_emb(fov_params)      # (B, query_dim)
-        queries     = self.object_queries.weight.unsqueeze(0).expand(B, -1, -1)
-        aug_queries = augment_queries(queries, embedding)  # (B, Q, D)
 
-        # ── Stage 2a: encode warped image once, decode object queries ─────────
+        # ── Stage 2a: encode warped image once (reused by denoising) ──────────
         features    = self.backbone(warped)                # 3-scale FPN features
-        enc_ctx     = self.detr.encode(features)           # reused by denoising
-        query_feats = self.detr.decode(enc_ctx, aug_queries)  # (B, Q, D)
+        enc_ctx     = self.detr.encode(features)
+
+        # ── Stage 2a': build object queries and decode ───────────────────────
+        enc_outputs = None
+        if self.two_stage:
+            # DINO 2-stage: the top-k encoder proposals become the decoder
+            # queries; the foveation context is added to the selected content.
+            sel         = self.detr.select_queries(enc_ctx)
+            aug_queries = sel["target"] + embedding.unsqueeze(1)
+            query_feats = self.detr.decode(
+                enc_ctx, aug_queries,
+                reference_points=sel["ref_points"], query_pos=sel["query_pos"],
+            )
+            enc_outputs = (sel["enc_class"], sel["enc_coord"])  # for the aux loss
+        else:
+            queries     = self.object_queries.weight.unsqueeze(0).expand(B, -1, -1)
+            aug_queries = augment_queries(queries, embedding)  # (B, Q, D)
+            query_feats = self.detr.decode(enc_ctx, aug_queries)
 
         # ── Stage 2b: predict + re-project ───────────────────────────────────
         boxes_ri, class_logits = self.box_head(query_feats)  # (B,Q,4), (B,Q,C)
@@ -455,15 +574,17 @@ class TelescopeModel(nn.Module):
         # info into the matching queries.
         dn_out = None
         if denoising is not None:
-            dn_out = self._denoising_pass(enc_ctx, embedding, *denoising)
+            dn_out = self._denoising_pass(enc_ctx, embedding, o, R, *denoising)
 
         if return_riemannian:
+            # enc_outputs is the last element on both training paths (None when
+            # one-stage), so the caller's arity depends only on `denoising`.
             if denoising is not None:
-                return boxes_eu, class_logits, o, R, boxes_ri, dn_out
-            return boxes_eu, class_logits, o, R, boxes_ri
+                return boxes_eu, class_logits, o, R, boxes_ri, dn_out, enc_outputs
+            return boxes_eu, class_logits, o, R, boxes_ri, enc_outputs
         return boxes_eu, class_logits, o, R
 
-    def _denoising_pass(self, enc_ctx, embedding, gt_boxes_list,
+    def _denoising_pass(self, enc_ctx, embedding, o, R, gt_boxes_list,
                         gt_labels_list, noise_scale: float = 0.4):
         """Build noised-GT queries and run one extra decoder pass.
 
@@ -472,9 +593,18 @@ class TelescopeModel(nn.Module):
         padded predictions and a validity mask, or ``None`` if the batch has no
         GT boxes.
 
+        The noised GT centre is projected to the Riemannian (warped) frame via
+        Φ before becoming a reference point — paper Appendix E: "the Euclidean
+        ground truth boxes are first noised, then projected to the Riemannian
+        space via (2) and appended to the queries".  This keeps the anchor in
+        the same frame as the encoder features (extracted from the warped image)
+        and the box head's Φ(c) prediction; a raw Euclidean centre would point
+        the deformable sampler at the wrong location near the foveation centre.
+
         Args:
             enc_ctx        : encoder context from ``self.detr.encode``
             embedding      : (B, query_dim) foveation embedding (added to queries)
+            o, R           : (B,2), (B,) foveation params for Φ
             gt_boxes_list  : list of (M_b, 4) Euclidean GT boxes in [-1, 1]
             gt_labels_list : list of (M_b,) class indices
             noise_scale    : std of box-relative Gaussian noise
@@ -500,9 +630,15 @@ class TelescopeModel(nn.Module):
             scale = torch.cat([gt[:, 2:3], gt[:, 3:4], gt[:, 2:3], gt[:, 3:4]], dim=-1)
             noisy = gt + torch.randn_like(gt) * noise_scale * scale
             centre = noisy[:, :2].clamp(-1.0, 1.0)
+            # Project the noised centre into the warped frame via Φ (Eq 2).  EPS
+            # in Φ underflows in fp16, so run the projection in fp32 (autocast off).
+            with torch.autocast(device_type=device.type, enabled=False):
+                phi_centre = hyperbolic_foveated_transform(
+                    centre.float(), o[b].float(), R[b].float(), self.alpha, self.p
+                )                                          # (m,2) warped centre in [-1,1]
             # Content query = per-class label embedding + foveation context.
             dn_q[b, :m]   = self.dn_label_emb(lbl) + embedding[b].unsqueeze(0)
-            dn_ref[b, :m] = ((centre + 1.0) * 0.5).clamp(0.0, 1.0)   # [-1,1] → [0,1]
+            dn_ref[b, :m] = ((phi_centre + 1.0) * 0.5).clamp(0.0, 1.0).to(dn_ref.dtype)  # warped [-1,1] → [0,1]
             dn_mask[b, :m] = True
 
         dn_feats = self.detr.decode(enc_ctx, dn_q, reference_points=dn_ref)

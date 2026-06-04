@@ -32,7 +32,8 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, DistributedSampler
 
 from telescope.pipeline import TelescopeModel
-from telescope.matcher import HungarianMatcher, match_and_compute_loss, compute_denoising_loss
+from telescope.matcher import (HungarianMatcher, match_and_compute_loss,
+                               compute_denoising_loss, compute_encoder_aux_loss)
 from telescope.eval import CocoEvaluator, DetectionResult, DISTANCE_BINS
 from telescope.data import Argoverse2Dataset, collate_fn, NUM_CLASSES, CLASS_NAMES
 from telescope.checkpoint import CheckpointManager
@@ -71,6 +72,12 @@ def parse_args():
                    help="box-relative Gaussian noise std for denoising queries")
     p.add_argument("--dn_weight",    type=float, default=1.0,
                    help="weight of the denoising loss in the total")
+    p.add_argument("--two_stage",    dest="two_stage", action="store_true", default=True,
+                   help="DINO two-stage query selection from encoder proposals (paper Table 9)")
+    p.add_argument("--no_two_stage", dest="two_stage", action="store_false",
+                   help="disable two-stage; use 300 learned object queries (one-stage)")
+    p.add_argument("--enc_weight",   type=float, default=1.0,
+                   help="weight of the two-stage encoder auxiliary loss")
     return p.parse_args()
 
 
@@ -99,6 +106,7 @@ def main():
         num_classes = NUM_CLASSES,
         num_queries = args.num_queries,
         query_dim   = args.query_dim,
+        two_stage   = args.two_stage,
     ).to(device)
 
     # Baseline ablation: fix R ≈ 0 so Phi(x) = x everywhere
@@ -117,7 +125,12 @@ def main():
         p.requires_grad_(False)
 
     if world_size > 1:
-        model = nn.parallel.DistributedDataParallel(model, device_ids=[rank])
+        # find_unused_parameters: two-stage leaves the learned object_queries /
+        # ref_pts (requires_grad=True but unused — queries come from encoder
+        # proposals) without a gradient, which DDP rejects unless told to expect it.
+        model = nn.parallel.DistributedDataParallel(
+            model, device_ids=[rank], find_unused_parameters=True
+        )
 
     # ── Optimizer + scheduler ─────────────────────────────────────────────────
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -198,10 +211,11 @@ def main():
                 dn_in = ((gt_boxes_list, gt_labels_list, args.dn_noise_scale)
                          if args.denoising else None)
                 out = _model(images, return_riemannian=True, denoising=dn_in)
+                # enc_out is always the last element (None when one-stage).
                 if args.denoising:
-                    boxes_eu, logits, o, R, boxes_ri, dn_out = out
+                    boxes_eu, logits, o, R, boxes_ri, dn_out, enc_out = out
                 else:
-                    boxes_eu, logits, o, R, boxes_ri = out
+                    boxes_eu, logits, o, R, boxes_ri, enc_out = out
                     dn_out = None
 
                 losses = match_and_compute_loss(
@@ -221,6 +235,16 @@ def main():
                     total = total + args.dn_weight * dn["loss_dn"]
                     losses["n_dn"] = dn["n_dn"]
 
+                # Two-stage encoder auxiliary loss — supervises the proposal
+                # heads that drive query selection (enc_out is None one-stage).
+                if enc_out is not None:
+                    enc = compute_encoder_aux_loss(
+                        enc_out[0], enc_out[1],
+                        gt_boxes_list, gt_labels_list, o, R,
+                    )
+                    total = total + args.enc_weight * enc["loss_enc"]
+                    losses["n_enc"] = enc["n_enc"]
+
                 # scale loss for gradient accumulation
                 loss = total / args.grad_accum
 
@@ -237,10 +261,11 @@ def main():
             epoch_loss += losses["loss_total"].item()
 
             if is_main and step % 50 == 0:
-                dn_str = f"  dn={losses['n_dn']}" if "n_dn" in losses else ""
+                dn_str  = f"  dn={losses['n_dn']}"  if "n_dn"  in losses else ""
+                enc_str = f"  enc={losses['n_enc']}" if "n_enc" in losses else ""
                 print(f"  epoch {epoch:3d}  step {step:5d}/{len(train_loader)}  "
                       f"loss={losses['loss_total'].item():.4f}  "
-                      f"matched={losses['n_matched']}{dn_str}")
+                      f"matched={losses['n_matched']}{dn_str}{enc_str}")
 
         avg_loss = epoch_loss / len(train_loader)
 
