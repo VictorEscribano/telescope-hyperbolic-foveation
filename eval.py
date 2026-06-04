@@ -22,13 +22,16 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast
 
 from telescope.pipeline import TelescopeModel
-from telescope.data import Argoverse2Dataset, collate_fn, NUM_CLASSES, CLASS_NAMES
+from telescope.data import collate_fn
 from telescope.eval import CocoEvaluator, DetectionResult
 from telescope.checkpoint import CheckpointManager
 
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--dataset",       type=str, default="argoverse2",
+                   choices=["argoverse2", "drones"],
+                   help="for drones, point --data_dir at the dataset root")
     p.add_argument("--data_dir",      type=str, required=True)
     p.add_argument("--checkpoint",    type=str, required=True)
     p.add_argument("--split",         type=str, default="val",
@@ -51,11 +54,11 @@ def parse_args():
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, score_threshold, fp16):
+def evaluate(model, loader, device, score_threshold, fp16, num_classes, class_names):
     model.eval()
     evaluator = CocoEvaluator(
-        num_classes = NUM_CLASSES - 1,
-        class_names = CLASS_NAMES[:-1],
+        num_classes = num_classes - 1,
+        class_names = class_names[:-1],
     )
 
     for images, targets in loader:
@@ -86,6 +89,15 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    # ── Dataset + class set selection ─────────────────────────────────────────
+    if args.dataset == "drones":
+        from telescope.data_drones import (DronesYoloDataset as DatasetCls,
+                                            DRONE_NUM_CLASSES as NUM_CLASSES,
+                                            DRONE_CLASS_NAMES as CLASS_NAMES)
+    else:
+        from telescope.data import (Argoverse2Dataset as DatasetCls,
+                                     NUM_CLASSES, CLASS_NAMES)
+
     # ── Model ─────────────────────────────────────────────────────────────────
     model = TelescopeModel(num_classes=NUM_CLASSES, two_stage=args.two_stage).to(device)
 
@@ -105,7 +117,7 @@ def main():
           f"(epoch {ckpt.get('epoch', '?')})")
 
     # ── Dataset ───────────────────────────────────────────────────────────────
-    ds = Argoverse2Dataset(
+    ds = DatasetCls(
         args.data_dir, split=args.split,
         image_size=tuple(args.image_size),
     )
@@ -116,7 +128,8 @@ def main():
     print(f"Dataset: {len(ds)} frames  ({args.split} split)")
 
     # ── Evaluate ──────────────────────────────────────────────────────────────
-    metrics = evaluate(model, loader, device, args.score_threshold, args.fp16)
+    metrics = evaluate(model, loader, device, args.score_threshold, args.fp16,
+                       NUM_CLASSES, CLASS_NAMES)
 
     print("\nResults:")
     for k, v in metrics.items():

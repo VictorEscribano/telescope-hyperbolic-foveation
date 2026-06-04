@@ -35,7 +35,7 @@ from telescope.pipeline import TelescopeModel
 from telescope.matcher import (HungarianMatcher, match_and_compute_loss,
                                compute_denoising_loss, compute_encoder_aux_loss)
 from telescope.eval import CocoEvaluator, DetectionResult, DISTANCE_BINS
-from telescope.data import Argoverse2Dataset, collate_fn, NUM_CLASSES, CLASS_NAMES
+from telescope.data import collate_fn
 from telescope.checkpoint import CheckpointManager
 
 
@@ -43,6 +43,11 @@ from telescope.checkpoint import CheckpointManager
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--dataset",     type=str, default="argoverse2",
+                   choices=["argoverse2", "drones"],
+                   help="argoverse2 (3D→2D) or drones (YOLO-format 2D). For "
+                        "drones, point --data_dir and --val_dir both at the "
+                        "dataset root (the loader picks the train/ and val/ subdirs).")
     p.add_argument("--data_dir",    type=str, required=True)
     p.add_argument("--val_dir",     type=str, required=True)
     p.add_argument("--output_dir",  type=str, default="./runs/run_01")
@@ -101,6 +106,15 @@ def main():
     rank, world_size, device = setup_ddp()
     is_main    = (rank == 0)
 
+    # ── Dataset + class set selection ─────────────────────────────────────────
+    if args.dataset == "drones":
+        from telescope.data_drones import (DronesYoloDataset as DatasetCls,
+                                            DRONE_NUM_CLASSES as NUM_CLASSES,
+                                            DRONE_CLASS_NAMES as CLASS_NAMES)
+    else:
+        from telescope.data import (Argoverse2Dataset as DatasetCls,
+                                     NUM_CLASSES, CLASS_NAMES)
+
     # ── Model ─────────────────────────────────────────────────────────────────
     model = TelescopeModel(
         num_classes = NUM_CLASSES,
@@ -152,10 +166,10 @@ def main():
         )
 
     # ── Data loaders ──────────────────────────────────────────────────────────
-    train_ds = Argoverse2Dataset(args.data_dir, split="train",
-                                  image_size=tuple(args.image_size))
-    val_ds   = Argoverse2Dataset(args.val_dir,  split="val",
-                                  image_size=tuple(args.image_size))
+    train_ds = DatasetCls(args.data_dir, split="train",
+                          image_size=tuple(args.image_size))
+    val_ds   = DatasetCls(args.val_dir,  split="val",
+                          image_size=tuple(args.image_size))
 
     train_sampler = DistributedSampler(train_ds) if world_size > 1 else None
     train_loader  = DataLoader(
@@ -273,7 +287,7 @@ def main():
         if is_main:
             metrics = _run_validation(
                 model if world_size == 1 else model.module,
-                val_loader, device
+                val_loader, device, NUM_CLASSES, CLASS_NAMES
             )
             metrics["loss"] = avg_loss
             elapsed = time.time() - t0
@@ -297,10 +311,10 @@ def main():
 
 
 @torch.no_grad()
-def _run_validation(model, val_loader, device) -> dict:
+def _run_validation(model, val_loader, device, num_classes, class_names) -> dict:
     model.eval()
-    evaluator = CocoEvaluator(num_classes=NUM_CLASSES - 1,
-                               class_names=CLASS_NAMES[:-1])
+    evaluator = CocoEvaluator(num_classes=num_classes - 1,
+                               class_names=class_names[:-1])
     for images, targets in val_loader:
         images = images.to(device)
         boxes_eu, logits, o, R = model(images)
