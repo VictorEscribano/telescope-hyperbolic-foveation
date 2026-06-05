@@ -17,6 +17,14 @@ data/
 # ── Third-party cloned repos ──────────────────────────────────────────
 sam3/
 sam2/
+EfficientTAM/
+
+# ── Offline wheel cache (regenerable, platform-specific binaries) ──────
+wheels_offline/
+
+# ── Didactic doc generator output (regenerable) ───────────────────────
+_doc_assets/
+generate_telescope_doc.py
 
 # ── Training outputs ──────────────────────────────────────────────────
 runs/

@@ -41,9 +41,15 @@ def parse_args():
     p.add_argument("--image_size",    type=int, nargs=2, default=[1024, 1024])
     p.add_argument("--score_threshold", type=float, default=0.05)
     p.add_argument("--fp16",          action="store_true", default=True)
+    p.add_argument("--backbone", type=str, default="sam3",
+                   choices=["sam3", "efficienttam"],
+                   help="must match the backbone the checkpoint was trained with")
     p.add_argument("--backbone_ckpt", type=str, default=None,
-                   help="SAM3.1 checkpoint — required if the model was trained with "
+                   help="backbone checkpoint — required if the model was trained with "
                         "the real backbone, so its weights match at load time")
+    p.add_argument("--et_config", type=str,
+                   default="configs/efficienttam/efficienttam_s.yaml",
+                   help="EfficientTAM Hydra config variant (must match training)")
     p.add_argument("--two_stage",    dest="two_stage", action="store_true", default=True,
                    help="build the DINO two-stage head (default; must match training)")
     p.add_argument("--no_two_stage", dest="two_stage", action="store_false",
@@ -105,11 +111,19 @@ def main():
     # with the real SAM3 backbone, rebuild it before load_state_dict (its weights
     # are then overwritten by the checkpoint's).
     if args.backbone_ckpt:
-        from telescope.backbone_sam3 import SAM3Backbone
-        model.backbone = SAM3Backbone(
-            checkpoint_path=args.backbone_ckpt,
-            out_channels=model.backbone.out_channels,
-        ).to(device)
+        if args.backbone == "efficienttam":
+            from telescope.backbone_efficienttam import EfficientTAMBackbone
+            model.backbone = EfficientTAMBackbone(
+                checkpoint_path=args.backbone_ckpt,
+                out_channels=model.backbone.out_channels,
+                config_file=args.et_config,
+            ).to(device)
+        else:
+            from telescope.backbone_sam3 import SAM3Backbone
+            model.backbone = SAM3Backbone(
+                checkpoint_path=args.backbone_ckpt,
+                out_channels=model.backbone.out_channels,
+            ).to(device)
 
     ckpt  = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])

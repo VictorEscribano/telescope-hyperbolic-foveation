@@ -31,6 +31,15 @@ import torch.distributed as dist
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, DistributedSampler
 
+# Input shapes are static here (fixed --image_size and --batch_size), so let
+# cuDNN benchmark/autotune the best conv algorithms once and reuse them. And on
+# Ampere+ (e.g. A10) allow TF32 for the fp32 matmuls in the geometry path — the
+# detector runs in fp16 and the SAM3 backbone in bf16, so neither is affected;
+# only the otherwise-slow fp32 Newton-Raphson/Jacobian matmuls speed up.
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 from telescope.pipeline import TelescopeModel
 from telescope.matcher import (HungarianMatcher, match_and_compute_loss,
                                compute_denoising_loss, compute_encoder_aux_loss)
@@ -63,8 +72,18 @@ def parse_args():
     p.add_argument("--grad_clip",   type=float, default=0.1)
     p.add_argument("--resume",      type=str, default=None,
                    help="path to checkpoint dir to resume from")
+    p.add_argument("--backbone", type=str, default="sam3",
+                   choices=["sam3", "efficienttam"],
+                   help="which frozen backbone to load when --backbone_ckpt is given. "
+                        "sam3 = SAM 3.1 (453M, max accuracy); efficienttam = "
+                        "EfficientTAM ViT (~10-40× lighter, edge real-time).")
     p.add_argument("--backbone_ckpt", type=str, default=None,
-                   help="path to SAM3.1 checkpoint (optional — uses stub if not given)")
+                   help="path to the backbone checkpoint (optional — uses stub if not "
+                        "given). SAM3.1: sam3.1_multiplex.pt; EfficientTAM: efficienttam_s.pt")
+    p.add_argument("--et_config", type=str,
+                   default="configs/efficienttam/efficienttam_s.yaml",
+                   help="EfficientTAM Hydra config (variant): *_s.yaml (1024, accuracy) "
+                        "or *_s_512x512.yaml / *_ti*.yaml (faster, edge)")
     p.add_argument("--no_foveation", action="store_true", default=False,
                    help="disable foveation (R fixed near zero) for ablation baseline")
     p.add_argument("--grad_accum",   type=int, default=1,
@@ -130,9 +149,12 @@ def main():
             param.requires_grad_(False)
         model.fov_estimator._no_foveation = True   # checked in forward below
 
-    # Optionally load real SAM3.1 backbone
+    # Optionally load a real (frozen) backbone in place of the stub.
     if args.backbone_ckpt:
-        _load_sam3_backbone(model, args.backbone_ckpt, device)
+        if args.backbone == "efficienttam":
+            _load_efficienttam_backbone(model, args.backbone_ckpt, device, args.et_config)
+        else:
+            _load_sam3_backbone(model, args.backbone_ckpt, device)
 
     # Freeze backbone
     for p in model.backbone.parameters():
@@ -343,6 +365,22 @@ def _load_sam3_backbone(model, ckpt_path, device):
     model.backbone = real
     n = sum(p.numel() for p in real.parameters())
     print(f"[backbone] SAM3.1 vision encoder wired ({n/1e6:.0f}M params, will be frozen)")
+
+
+def _load_efficienttam_backbone(model, ckpt_path, device, config_file):
+    """Swap SAM3EncoderStub for the frozen EfficientTAM ViT image encoder."""
+    from telescope.backbone_efficienttam import EfficientTAMBackbone
+    print(f"[backbone] loading EfficientTAM image encoder from {ckpt_path} "
+          f"(config: {config_file}) ...")
+    real = EfficientTAMBackbone(
+        checkpoint_path=ckpt_path,
+        out_channels=model.backbone.out_channels,   # = query_dim (must be 256)
+        config_file=config_file,
+    ).to(device)
+    model.backbone = real
+    n = sum(p.numel() for p in real.parameters())
+    print(f"[backbone] EfficientTAM image encoder wired ({n/1e6:.0f}M params, "
+          f"will be frozen)")
 
 
 def _oom_hint(args):

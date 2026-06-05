@@ -75,6 +75,50 @@ Same ViT-H backbone family — a drop-in substitute while waiting for SAM 3.1 ap
 </details>
 
 <details>
+<summary><b>EfficientTAM backbone (lightweight — for edge / real-time)</b></summary>
+
+SAM 3.1 (453M) is the accuracy ceiling but is too heavy for edge devices (~2–4 FPS on an
+A10; not real-time on Jetson even with TensorRT). **EfficientTAM** is a ~22M-param SAM-family
+ViT encoder (~20× lighter, ~151 FPS on A100, >10 FPS on an iPhone) — a drop-in alternative
+backbone behind the same interface. Pick it with `--backbone efficienttam`.
+
+```bash
+git clone https://github.com/yformer/EfficientTAM && pip install -e EfficientTAM --no-deps
+pip install hydra-core omegaconf iopath          # EfficientTAM runtime deps
+python - <<'EOF'
+from huggingface_hub import hf_hub_download
+hf_hub_download(repo_id="yunyangx/efficient-track-anything",
+                filename="efficienttam_s.pt", local_dir="checkpoints")
+EOF
+```
+
+The `EfficientTAMBackbone` (`telescope/backbone_efficienttam.py`) wraps EfficientTAM's single
+ViTDet feature map into the 3-level (256-ch, coarse→fine) pyramid the pipeline expects, and
+stays fully frozen. The foveation is what keeps a small backbone viable for tiny objects.
+Variants via `--et_config` (e.g. `configs/efficienttam/efficienttam_s_512x512.yaml` is faster).
+</details>
+
+<details>
+<summary><b>Offline / air-gapped server install</b></summary>
+
+For a server with **no internet**, pre-download wheels on a connected machine into
+`wheels_offline/`, rsync the repo (excluding the non-portable venv), then install from the
+local wheel cache:
+
+```bash
+# on the server, inside the venv:
+pip install --no-index --find-links wheels_offline \
+    hydra-core omegaconf antlr4-python3-runtime iopath portalocker
+pip install -e EfficientTAM --no-index --no-build-isolation --no-deps   # or sam3
+```
+
+Vendor a backbone repo (`sam3/` or `EfficientTAM/`) and rsync the matching checkpoint into
+`checkpoints/` separately (large file). `rsync` exclude patterns must be **anchored**
+(`--exclude='/data/'`, not `--exclude='data/'`) so they don't also skip nested package dirs
+like `sam3/sam3/train/data/`.
+</details>
+
+<details>
 <summary><b>Argoverse 2 dataset (TruckDrive substitute)</b></summary>
 
 TruckDrive (the paper's dataset, up to 1 km) is not yet public. Argoverse 2 covers up to
@@ -161,6 +205,44 @@ python train.py \
     --resume   ./runs/run_01 \
     --fp16
 ```
+
+### Choosing a backbone (`--backbone`)
+
+| `--backbone` | Encoder | Params | Use for |
+|---|---|---|---|
+| `sam3` *(default)* | SAM 3.1 ViT | 453M | Maximum accuracy (server) |
+| `efficienttam` | EfficientTAM ViT-S | ~22M | Edge / real-time (Jetson) |
+
+```bash
+# SAM 3.1 (accuracy ceiling)
+python train.py ... --backbone sam3        --backbone_ckpt ./checkpoints/sam3.1_multiplex.pt --fp16
+
+# EfficientTAM (lightweight, edge target)
+python train.py ... --backbone efficienttam --backbone_ckpt ./checkpoints/efficienttam_s.pt --fp16
+```
+
+Both load behind the same `--backbone_ckpt` flag and the rest of the pipeline is identical, so
+you can train both and compare mAP. The startup log prints
+`[backbone] loaded N ... weights` to confirm the encoder is wired.
+
+### Drone dataset (YOLO format)
+
+For a single-class YOLO-format drone dataset, point `--data_dir`/`--val_dir` at the dataset
+**root** (the loader finds the `train/` and `val/` subdirs). Labels are `class cx cy w h`
+in `[0,1]`; images with no label file are treated as background negatives.
+
+```bash
+python train.py \
+    --dataset drones \
+    --data_dir /path/to/drones_v5 \
+    --val_dir  /path/to/drones_v5 \
+    --backbone efficienttam --backbone_ckpt ./checkpoints/efficienttam_s.pt \
+    --image_size 1024 1024 --batch_size 4 --epochs 4 \
+    --output_dir ./runs/drones 2>&1 | tee runs/drones/train.log
+```
+
+`--dataset drones` switches to the 2-class set (`Drone`, `__background__`); evaluation skips
+the per-distance-bin mAP (no 3-D range in this dataset).
 
 ### With SAM3.1 backbone (once downloaded)
 
@@ -271,6 +353,9 @@ telescope/                  the importable package (single source of truth)
 ├── matcher.py      HungarianMatcher, match_and_compute_loss
 ├── eval.py         CocoEvaluator (mAP, mAP@50, per-distance bins)
 ├── data.py         Argoverse2Dataset, collate_fn
+├── data_drones.py  DronesYoloDataset (single-class YOLO format)
+├── backbone_sam3.py         SAM3Backbone (453M, frozen — max accuracy)
+├── backbone_efficienttam.py EfficientTAMBackbone (~22M, frozen — edge)
 ├── checkpoint.py   CheckpointManager (save/load/best-tracking/rotation)
 └── pipeline.py     TelescopeModel (full two-stage system)
 
