@@ -83,7 +83,10 @@ ViT encoder (~20× lighter, ~151 FPS on A100, >10 FPS on an iPhone) — a drop-i
 backbone behind the same interface. Pick it with `--backbone efficienttam`.
 
 ```bash
-git clone https://github.com/yformer/EfficientTAM && pip install -e EfficientTAM --no-deps
+# vendor the package source (or use the EfficientTAM/ already in the repo) ...
+git clone https://github.com/yformer/EfficientTAM
+# ... and install it editable INTO THE VENV (one-time per environment):
+pip install -e EfficientTAM --no-build-isolation --no-deps
 pip install hydra-core omegaconf iopath          # EfficientTAM runtime deps
 python - <<'EOF'
 from huggingface_hub import hf_hub_download
@@ -91,6 +94,14 @@ hf_hub_download(repo_id="yunyangx/efficient-track-anything",
                 filename="efficienttam_s.pt", local_dir="checkpoints")
 EOF
 ```
+
+> **Note — the editable install is per-environment, not tracked by git.** `EfficientTAM/`
+> and `checkpoints/` are in `.gitignore`, so they do **not** travel with `git pull`. On every
+> machine you train/eval on (e.g. a fresh server), you must (1) make the `EfficientTAM/` source
+> present (rsync or `git clone`), (2) re-run `pip install -e EfficientTAM ...` inside that venv,
+> and (3) rsync the `efficienttam_s.pt` checkpoint into `checkpoints/` separately. Skipping (2)
+> gives `ModuleNotFoundError: No module named 'efficient_track_anything'` at backbone load.
+> A correct install prints `[backbone] loaded 153 EfficientTAM encoder weights (ignored 0 ...)`.
 
 The `EfficientTAMBackbone` (`telescope/backbone_efficienttam.py`) wraps EfficientTAM's single
 ViTDet feature map into the 3-level (256-ch, coarse→fine) pyramid the pipeline expects, and
