@@ -16,7 +16,7 @@
 #   ./ship_efficienttam_offline.sh user@server-host [dest_dir]
 #
 #   dest_dir defaults to:
-#     /home/ia/Documentos/hyperbolic_foveation_drones/edgetam_telescope
+#     /home/ia/Documentos/hyperbolic_foveation_drones/efficienttam_telescope
 #
 # Idempotent: rebuilding reuses local files; rsync only sends what changed.
 
@@ -29,18 +29,18 @@ warn() { echo -e "${YELLOW}⚠${NC}  $*"; }
 err()  { echo -e "${RED}✗${NC} $*"; }
 
 SERVER="${1:-}"
-DEST="${2:-/home/ia/Documentos/hyperbolic_foveation_drones/edgetam_telescope}"
+DEST="${2:-/home/ia/Documentos/hyperbolic_foveation_drones/efficienttam_telescope}"
 
 if [[ -z "$SERVER" ]]; then
     err "Missing server target."
     echo "usage: $0 user@server-host [dest_dir]"
     echo "  e.g.  $0 ia@10.0.0.42"
-    echo "  dest_dir default: /home/ia/Documentos/hyperbolic_foveation_drones/edgetam_telescope"
+    echo "  dest_dir default: /home/ia/Documentos/hyperbolic_foveation_drones/efficienttam_telescope"
     exit 1
 fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUNDLE="${HERE}/edgetam_offline_bundle"
+BUNDLE="${HERE}/efficienttam_offline_bundle"
 WHEELS="${BUNDLE}/wheels"
 PY="${HERE}/.telescope/bin/python"
 [[ -x "$PY" ]] || PY="$(command -v python3 || command -v python)"
