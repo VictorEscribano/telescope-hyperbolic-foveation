@@ -325,10 +325,13 @@ def main():
                 n = step + 1
                 mem = (torch.cuda.max_memory_allocated(device) / 1e9
                        if torch.cuda.is_available() else 0.0)
+                # refresh=False: just stash the postfix; let tqdm redraw on its
+                # own mininterval. Otherwise set_postfix_str forces a refresh
+                # every step and floods a tee'd (non-TTY) log regardless.
                 pbar.set_postfix_str(
                     f"loss={epoch_loss / n:.3f} l1={epoch_l1 / n:.3f} "
                     f"giou={epoch_giou / n:.3f} cls={epoch_cls / n:.3f} "
-                    f"mem={mem:.1f}G")
+                    f"mem={mem:.1f}G", refresh=False)
 
         nb = len(train_loader)
         avg_loss = epoch_loss / nb
