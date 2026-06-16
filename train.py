@@ -46,6 +46,9 @@ from telescope.matcher import (HungarianMatcher, match_and_compute_loss,
 from telescope.eval import CocoEvaluator, DetectionResult, DISTANCE_BINS
 from telescope.data import collate_fn
 from telescope.checkpoint import CheckpointManager
+from telescope.trainlog import MetricsLogger
+
+from tqdm import tqdm
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
@@ -221,15 +224,24 @@ def main():
     matcher = HungarianMatcher(cost_cls=1.0, cost_l1=5.0, cost_giou=2.0)
 
     # ── Training loop ─────────────────────────────────────────────────────────
+    logger = MetricsLogger(args.output_dir, args.epochs) if is_main else None
+
     for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         model.train()
-        epoch_loss = 0.0
+        epoch_loss = epoch_l1 = epoch_giou = epoch_cls = 0.0
         t0 = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
 
-        for step, (images, targets) in enumerate(train_loader):
+        pbar = train_loader
+        if is_main:
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}",
+                        dynamic_ncols=True, leave=False)
+
+        for step, (images, targets) in enumerate(pbar):
             images = images.to(device)
             gt_boxes_list  = [t["boxes"].to(device)  for t in targets]
             gt_labels_list = [t["labels"].to(device) for t in targets]
@@ -295,29 +307,49 @@ def main():
             global_step += 1
 
             epoch_loss += losses["loss_total"].item()
+            epoch_l1   += losses["loss_l1"].item()
+            epoch_giou += losses["loss_giou"].item()
+            epoch_cls  += losses["loss_cls"].item()
 
-            if is_main and step % 50 == 0:
-                dn_str  = f"  dn={losses['n_dn']}"  if "n_dn"  in losses else ""
-                enc_str = f"  enc={losses['n_enc']}" if "n_enc" in losses else ""
-                print(f"  epoch {epoch:3d}  step {step:5d}/{len(train_loader)}  "
-                      f"loss={losses['loss_total'].item():.4f}  "
-                      f"matched={losses['n_matched']}{dn_str}{enc_str}")
+            if is_main:
+                n = step + 1
+                mem = (torch.cuda.max_memory_allocated(device) / 1e9
+                       if torch.cuda.is_available() else 0.0)
+                pbar.set_postfix_str(
+                    f"loss={epoch_loss / n:.3f} l1={epoch_l1 / n:.3f} "
+                    f"giou={epoch_giou / n:.3f} cls={epoch_cls / n:.3f} "
+                    f"mem={mem:.1f}G")
 
-        avg_loss = epoch_loss / len(train_loader)
+        nb = len(train_loader)
+        avg_loss = epoch_loss / nb
 
         # ── Validation ────────────────────────────────────────────────────────
         if is_main:
             metrics = _run_validation(
                 model if world_size == 1 else model.module,
-                val_loader, device, NUM_CLASSES, CLASS_NAMES
+                val_loader, device, NUM_CLASSES, CLASS_NAMES, matcher,
             )
             metrics["loss"] = avg_loss
             elapsed = time.time() - t0
-            print(f"epoch {epoch:3d}  loss={avg_loss:.4f}  "
-                  f"mAP={metrics.get('mAP', 0):.4f}  "
-                  f"mAP50={metrics.get('mAP_50', 0):.4f}  "
-                  f"time={elapsed:.0f}s")
-            # Per-distance-bin mAP (paper's headline metric), when available
+            gpu_mem = (torch.cuda.max_memory_allocated(device) / 1e9
+                       if torch.cuda.is_available() else 0.0)
+
+            # Ultralytics-style per-epoch row → console table + results.csv.
+            logger.log(epoch, {
+                "epoch":            epoch,
+                "time_s":           elapsed,
+                "lr":               optimizer.param_groups[0]["lr"],
+                "train/loss":       avg_loss,
+                "train/l1":         epoch_l1 / nb,
+                "train/giou":       epoch_giou / nb,
+                "train/cls":        epoch_cls / nb,
+                "val/loss":         metrics.get("val_loss", float("nan")),
+                "metrics/mAP50-95": metrics.get("mAP", 0.0),
+                "metrics/mAP50":    metrics.get("mAP_50", 0.0),
+                "metrics/recall":   metrics.get("recall", 0.0),
+            }, gpu_mem_gb=gpu_mem)
+
+            # Per-distance-bin mAP (paper's headline metric), when available.
             dist_bins = [f"{name}={metrics[f'mAP_{name}']:.3f}"
                          for name, _, _ in DISTANCE_BINS
                          if f"mAP_{name}" in metrics]
@@ -328,18 +360,34 @@ def main():
                 optimizer, epoch, metrics, scaler
             )
 
+    if is_main and logger is not None:
+        logger.plot()
+
     if world_size > 1:
         dist.destroy_process_group()
 
 
 @torch.no_grad()
-def _run_validation(model, val_loader, device, num_classes, class_names) -> dict:
+def _run_validation(model, val_loader, device, num_classes, class_names,
+                    matcher) -> dict:
     model.eval()
     evaluator = CocoEvaluator(num_classes=num_classes - 1,
                                class_names=class_names[:-1])
+    val_loss, n_batches = 0.0, 0
     for images, targets in val_loader:
         images = images.to(device)
-        boxes_eu, logits, o, R = model(images)
+        gt_boxes  = [t["boxes"].to(device)  for t in targets]
+        gt_labels = [t["labels"].to(device) for t in targets]
+
+        # Same forward as training (riemannian boxes) so the val loss is
+        # directly comparable to train loss; boxes_eu feed the COCO evaluator.
+        boxes_eu, logits, o, R, boxes_ri, _enc = model(images,
+                                                        return_riemannian=True)
+        losses = match_and_compute_loss(boxes_ri, logits, gt_boxes, gt_labels,
+                                        o, R, matcher, num_classes)
+        val_loss += losses["loss_total"].item()
+        n_batches += 1
+
         probs  = logits.softmax(-1)[:, :, :-1]
         scores, labels = probs.max(-1)
         for b, target in enumerate(targets):
@@ -351,7 +399,9 @@ def _run_validation(model, val_loader, device, num_classes, class_names) -> dict
                                   target["image_id"])],
                 [target]
             )
-    return evaluator.summarize()
+    metrics = evaluator.summarize()
+    metrics["val_loss"] = val_loss / max(1, n_batches)
+    return metrics
 
 
 def _load_sam3_backbone(model, ckpt_path, device):

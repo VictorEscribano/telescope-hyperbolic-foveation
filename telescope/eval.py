@@ -22,6 +22,8 @@ Usage::
     print(metrics)
 """
 
+import io
+import contextlib
 import torch
 from torch import Tensor
 from typing import List, Dict
@@ -168,21 +170,25 @@ class CocoEvaluator:
         ]
         images = [{"id": iid} for iid in set(self._image_ids)]
 
-        coco_gt = COCO()
-        coco_gt.dataset = {
-            "info": {},
-            "licenses": [],
-            "images": images,
-            "annotations": self._ground_truth,
-            "categories": categories,
-        }
-        coco_gt.createIndex()
+        # pycocotools prints a verbose AP/AR block + "creating index..." to
+        # stdout; silence it so the trainer's tidy per-epoch table stays clean
+        # (every number we need is in evaluator.stats anyway).
+        with contextlib.redirect_stdout(io.StringIO()):
+            coco_gt = COCO()
+            coco_gt.dataset = {
+                "info": {},
+                "licenses": [],
+                "images": images,
+                "annotations": self._ground_truth,
+                "categories": categories,
+            }
+            coco_gt.createIndex()
 
-        coco_dt = coco_gt.loadRes(self._predictions)
-        evaluator = COCOeval(coco_gt, coco_dt, "bbox")
-        evaluator.evaluate()
-        evaluator.accumulate()
-        evaluator.summarize()
+            coco_dt = coco_gt.loadRes(self._predictions)
+            evaluator = COCOeval(coco_gt, coco_dt, "bbox")
+            evaluator.evaluate()
+            evaluator.accumulate()
+            evaluator.summarize()
 
         stats = evaluator.stats
         metrics = {
@@ -192,6 +198,7 @@ class CocoEvaluator:
             "mAP_small":  float(stats[3]),
             "mAP_medium": float(stats[4]),
             "mAP_large":  float(stats[5]),
+            "recall":     float(stats[8]),   # AR @ IoU 0.50:0.95, maxDets=100
         }
 
         # ── Per-distance-bin mAP (TruckDrive protocol) ────────────────────────
@@ -225,15 +232,16 @@ class CocoEvaluator:
         if n_in == 0:
             return None
 
-        coco_gt = COCO()
-        coco_gt.dataset = {"info": {}, "licenses": [], "images": images,
-                           "annotations": anns, "categories": categories}
-        coco_gt.createIndex()
-        coco_dt = coco_gt.loadRes(self._predictions)
-        ev = COCOeval(coco_gt, coco_dt, "bbox")
-        ev.evaluate()
-        ev.accumulate()
-        ev.summarize()
+        with contextlib.redirect_stdout(io.StringIO()):
+            coco_gt = COCO()
+            coco_gt.dataset = {"info": {}, "licenses": [], "images": images,
+                               "annotations": anns, "categories": categories}
+            coco_gt.createIndex()
+            coco_dt = coco_gt.loadRes(self._predictions)
+            ev = COCOeval(coco_gt, coco_dt, "bbox")
+            ev.evaluate()
+            ev.accumulate()
+            ev.summarize()
         return float(ev.stats[0]), float(ev.stats[1])
 
     def reset(self) -> None:
