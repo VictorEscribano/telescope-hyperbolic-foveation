@@ -170,6 +170,8 @@ class CocoEvaluator:
 
         coco_gt = COCO()
         coco_gt.dataset = {
+            "info": {},
+            "licenses": [],
             "images": images,
             "annotations": self._ground_truth,
             "categories": categories,
@@ -224,8 +226,8 @@ class CocoEvaluator:
             return None
 
         coco_gt = COCO()
-        coco_gt.dataset = {"images": images, "annotations": anns,
-                           "categories": categories}
+        coco_gt.dataset = {"info": {}, "licenses": [], "images": images,
+                           "annotations": anns, "categories": categories}
         coco_gt.createIndex()
         coco_dt = coco_gt.loadRes(self._predictions)
         ev = COCOeval(coco_gt, coco_dt, "bbox")
