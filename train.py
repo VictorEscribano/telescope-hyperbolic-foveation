@@ -92,6 +92,11 @@ def parse_args():
                    help="disable foveation (R fixed near zero) for ablation baseline")
     p.add_argument("--grad_accum",   type=int, default=1,
                    help="gradient accumulation steps (use 2 on 14GB VRAM for effective batch=4)")
+    p.add_argument("--save_every",   type=int, default=1,
+                   help="write a rotating epoch checkpoint every N epochs (each ~250MB). "
+                        "checkpoint_best.pt is always kept up to date regardless.")
+    p.add_argument("--keep_last",    type=int, default=3,
+                   help="how many recent epoch checkpoints to keep on disk (older deleted)")
     p.add_argument("--denoising",    action="store_true", default=True,
                    help="DINO-style denoising auxiliary loss (paper §4)")
     p.add_argument("--no_denoising", dest="denoising", action="store_false",
@@ -182,7 +187,7 @@ def main():
     scaler    = GradScaler("cuda", enabled=args.fp16, init_scale=2**13)
 
     # ── Checkpoint manager ────────────────────────────────────────────────────
-    ckpt_mgr    = CheckpointManager(args.output_dir, keep_last=3)
+    ckpt_mgr    = CheckpointManager(args.output_dir, keep_last=args.keep_last)
     start_epoch = 0
     if args.resume:
         ckpt_mgr_resume = CheckpointManager(args.resume)
@@ -360,9 +365,13 @@ def main():
                          if f"mAP_{name}" in metrics]
             if dist_bins:
                 print("           mAP by distance(m):  " + "  ".join(dist_bins))
+            # Write a rotating checkpoint every --save_every epochs (and always
+            # on the last one); best is updated inside save() regardless.
+            periodic = (((epoch + 1) % args.save_every == 0)
+                        or (epoch + 1 == args.epochs))
             ckpt_mgr.save(
                 model if world_size == 1 else model.module,
-                optimizer, epoch, metrics, scaler
+                optimizer, epoch, metrics, scaler, write_periodic=periodic,
             )
 
     if is_main and logger is not None:
