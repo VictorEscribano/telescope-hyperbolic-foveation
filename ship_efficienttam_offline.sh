@@ -126,6 +126,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "Installing EfficientTAM offline from ${HERE}"
+# Skip the CUDA `_C` extension: it's for mask/video post-processing, NOT the
+# image encoder we use as a backbone — and compiling it with nvcc is slow
+# (often looks like a hang). The backbone imports and runs fine without it.
+export Efficient_Track_Anything_BUILD_CUDA=0
 # Build backend first (fresh py3.12 venvs ship without setuptools).
 pip install --no-index --find-links "${HERE}/wheels" setuptools wheel
 pip install --no-index --find-links "${HERE}/wheels" \
