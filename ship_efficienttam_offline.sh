@@ -7,7 +7,7 @@
 # checkpoint. This script collects everything EfficientTAM needs:
 #   - the 5 pure-python runtime wheels (hydra-core, omegaconf, antlr4-runtime,
 #     iopath, portalocker)
-#   - the EfficientTAM package source (editable-installable on the server)
+#   - the EfficientTAM package source (made importable via a .pth — no build)
 #   - the efficienttam_s.pt checkpoint (~131 MB)
 #   - install_on_server.sh — run it on the server, inside the target venv
 # ...into one folder, then rsync/scp that folder to the server.
@@ -126,15 +126,17 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "Installing EfficientTAM offline from ${HERE}"
-# Skip the CUDA `_C` extension: it's for mask/video post-processing, NOT the
-# image encoder we use as a backbone — and compiling it with nvcc is slow
-# (often looks like a hang). The backbone imports and runs fine without it.
-export Efficient_Track_Anything_BUILD_CUDA=0
-# Build backend first (fresh py3.12 venvs ship without setuptools).
-pip install --no-index --find-links "${HERE}/wheels" setuptools wheel
+# Runtime deps (no-op if the venv already has them).
 pip install --no-index --find-links "${HERE}/wheels" \
     hydra-core omegaconf antlr4-python3-runtime iopath portalocker
-pip install --no-index --no-build-isolation --no-deps -e "${HERE}/EfficientTAM"
+
+# Make efficient_track_anything importable via a .pth on site-packages instead
+# of `pip install -e`. Reason: the legacy `setup.py develop` HANGS on an
+# air-gapped server (no package index to reach) and would also try to nvcc-build
+# the unused CUDA `_C` extension. The package is pure-python and `_C` is optional
+# and unused by the image-encoder backbone, so a path entry is instant and enough.
+SP=$(python -c "import site; print(site.getsitepackages()[0])")
+echo "${HERE}/EfficientTAM" > "${SP}/efficienttam.pth"
 
 python -c "import efficient_track_anything; print('efficient_track_anything import OK')"
 echo
