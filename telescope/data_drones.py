@@ -106,7 +106,7 @@ class DronesYoloDataset(Dataset):
         return image, {
             "boxes":     boxes,                             # (M,4) [cx,cy,w,h] in [-1,1]
             "labels":    labels,                            # (M,)  all 0 (Drone)
-            "distances": torch.zeros(len(labels), dtype=torch.float32),  # no 3-D range
+            "distances": torch.full((len(labels),), -1.0, dtype=torch.float32),  # no 3-D range → -1 = unknown, so the evaluator skips per-distance-bin mAP
             "image_id":  idx,
             "file_name": img_path.name,
         }
