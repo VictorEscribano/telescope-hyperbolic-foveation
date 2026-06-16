@@ -21,8 +21,10 @@ chmod +x install.sh
 2. Installs core dependencies (and optionally the training extras)
 3. Downloads a backbone — **asks if you've been approved for SAM 3.1**; if yes it asks for
    your HuggingFace token and downloads it, otherwise it falls back to SAM 2.1 automatically
-4. Optionally downloads the Argoverse 2 dataset
-5. Runs a self-test to confirm everything works
+4. Optionally sets up the **EfficientTAM** lightweight backbone (edge / drone training):
+   editable-installs the package into the venv and downloads `efficienttam_s.pt` (public)
+5. Optionally downloads the Argoverse 2 dataset
+6. Runs a self-test to confirm everything works
 
 It is safe to re-run — completed steps are skipped.
 
