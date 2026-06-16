@@ -56,3 +56,6 @@ comparison.png
 .idea/
 .vscode/
 *.swp
+
+# Offline EfficientTAM bundle (built by ship_efficienttam_offline.sh)
+edgetam_offline_bundle/
