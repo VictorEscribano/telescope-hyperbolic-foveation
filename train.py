@@ -19,6 +19,7 @@ Key hyperparameters match paper Table 9:
 
 import argparse
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -238,8 +239,12 @@ def main():
 
         pbar = train_loader
         if is_main:
+            # Under `... | tee log`, stderr is not a TTY and tqdm writes one
+            # line PER refresh, flooding the log. Refresh ~once/min in that case
+            # (keeps train.log small/readable) and snappily on a real terminal.
+            _refresh = 0.5 if sys.stderr.isatty() else 60.0
             pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}",
-                        dynamic_ncols=True, leave=False)
+                        dynamic_ncols=True, leave=False, mininterval=_refresh)
 
         for step, (images, targets) in enumerate(pbar):
             images = images.to(device)
