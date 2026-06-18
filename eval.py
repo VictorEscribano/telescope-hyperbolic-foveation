@@ -67,6 +67,10 @@ def evaluate(model, loader, device, score_threshold, fp16, num_classes, class_na
         class_names = class_names[:-1],
     )
 
+    # Foveation diagnostics — see train.py:_run_validation.  Confirms whether the
+    # learned lens (o,R) tracks the targets or has collapsed to a fixed point.
+    fov_o, fov_R         = [], []
+    fov_d_fov, fov_d_cen = [], []
     for images, targets in loader:
         images = images.to(device)
         with autocast(enabled=fp16):
@@ -75,7 +79,14 @@ def evaluate(model, loader, device, score_threshold, fp16, num_classes, class_na
         probs  = logits.softmax(-1)[:, :, :-1]   # exclude background
         scores, labels = probs.max(-1)
 
+        fov_o.append(o.detach().float().cpu())
+        fov_R.append(R.detach().float().cpu())
         for b, target in enumerate(targets):
+            gb = target["boxes"]
+            if gb.numel():
+                gt_c = gb[:, :2].mean(0).float()              # mean GT centre [-1,1]
+                fov_d_fov.append((o[b, :2].detach().float().cpu() - gt_c).norm().item())
+                fov_d_cen.append(gt_c.norm().item())
             keep = scores[b] > score_threshold
             evaluator.update(
                 [DetectionResult(
@@ -87,7 +98,19 @@ def evaluate(model, loader, device, score_threshold, fp16, num_classes, class_na
                 [target],
             )
 
-    return evaluator.summarize()
+    metrics = evaluator.summarize()
+    if fov_o:
+        o_all, R_all = torch.cat(fov_o), torch.cat(fov_R)
+        metrics["fov/o_x_mean"] = o_all[:, 0].mean().item()
+        metrics["fov/o_y_mean"] = o_all[:, 1].mean().item()
+        metrics["fov/o_x_std"]  = o_all[:, 0].std(unbiased=False).item()
+        metrics["fov/o_y_std"]  = o_all[:, 1].std(unbiased=False).item()
+        metrics["fov/R_mean"]   = R_all.mean().item()
+        metrics["fov/R_std"]    = R_all.std(unbiased=False).item()
+        if fov_d_fov:
+            metrics["fov/dist_to_gt"]  = sum(fov_d_fov) / len(fov_d_fov)
+            metrics["fov/dist_cen_gt"] = sum(fov_d_cen) / len(fov_d_cen)
+    return metrics
 
 
 def main():

@@ -368,6 +368,18 @@ def main():
                          if f"mAP_{name}" in metrics]
             if dist_bins:
                 print("           mAP by distance(m):  " + "  ".join(dist_bins))
+            # Foveation health: o spread (std≈0 ⇒ collapsed to a fixed point) and
+            # whether the lens beats a static centre at reaching the targets
+            # (dist_to_gt < dist_cen_gt ⇒ the warp is actually tracking drones).
+            if "fov/o_x_mean" in metrics:
+                line = ("           foveation: "
+                        f"o=({metrics['fov/o_x_mean']:+.3f},{metrics['fov/o_y_mean']:+.3f}) "
+                        f"std=({metrics['fov/o_x_std']:.3f},{metrics['fov/o_y_std']:.3f}) "
+                        f"R={metrics['fov/R_mean']:.3f}±{metrics['fov/R_std']:.3f}")
+                if "fov/dist_to_gt" in metrics:
+                    line += (f"  |o-gt|={metrics['fov/dist_to_gt']:.3f} "
+                             f"(centre={metrics['fov/dist_cen_gt']:.3f})")
+                print(line)
             # Write a rotating checkpoint every --save_every epochs (and always
             # on the last one); best is updated inside save() regardless.
             periodic = (((epoch + 1) % args.save_every == 0)
@@ -391,6 +403,14 @@ def _run_validation(model, val_loader, device, num_classes, class_names,
     evaluator = CocoEvaluator(num_classes=num_classes - 1,
                                class_names=class_names[:-1])
     val_loss, n_batches = 0.0, 0
+    # Foveation diagnostics: is the learned lens (o,R) tracking targets, or has
+    # it collapsed to a fixed point?  We accumulate (o,R) over the split and
+    # compare |o − GT-centroid| against |center(0,0) − GT-centroid| — a static
+    # centre lens.  If the learned foveation is no closer to the targets than a
+    # fixed centre, the warp adds nothing (the "vanishing-point prior" fails for
+    # drones, which appear anywhere).  See FoveationEstimator (single global o,R).
+    fov_o, fov_R          = [], []   # per-image centres (N,2) and radii (N,)
+    fov_d_fov, fov_d_cen  = [], []   # |o−GT_c| and |0−GT_c|, images with ≥1 GT
     for images, targets in val_loader:
         images = images.to(device)
         gt_boxes  = [t["boxes"].to(device)  for t in targets]
@@ -405,6 +425,15 @@ def _run_validation(model, val_loader, device, num_classes, class_names,
         val_loss += losses["loss_total"].item()
         n_batches += 1
 
+        fov_o.append(o.detach().float().cpu())
+        fov_R.append(R.detach().float().cpu())
+        for b in range(len(targets)):
+            gb = gt_boxes[b]
+            if gb.numel():                                # mean GT centre in [-1,1]
+                gt_c = gb[:, :2].mean(0).detach().float().cpu()
+                fov_d_fov.append((o[b, :2].detach().float().cpu() - gt_c).norm().item())
+                fov_d_cen.append(gt_c.norm().item())      # static-centre baseline
+
         probs  = logits.softmax(-1)[:, :, :-1]
         scores, labels = probs.max(-1)
         for b, target in enumerate(targets):
@@ -418,6 +447,20 @@ def _run_validation(model, val_loader, device, num_classes, class_names,
             )
     metrics = evaluator.summarize()
     metrics["val_loss"] = val_loss / max(1, n_batches)
+
+    # ── Foveation diagnostics (extra keys; ignored by logger/checkpoint) ──────
+    if fov_o:
+        o_all = torch.cat(fov_o)                          # (N,2)
+        R_all = torch.cat(fov_R)                          # (N,)
+        metrics["fov/o_x_mean"] = o_all[:, 0].mean().item()
+        metrics["fov/o_y_mean"] = o_all[:, 1].mean().item()
+        metrics["fov/o_x_std"]  = o_all[:, 0].std(unbiased=False).item()
+        metrics["fov/o_y_std"]  = o_all[:, 1].std(unbiased=False).item()
+        metrics["fov/R_mean"]   = R_all.mean().item()
+        metrics["fov/R_std"]    = R_all.std(unbiased=False).item()
+        if fov_d_fov:
+            metrics["fov/dist_to_gt"]  = sum(fov_d_fov) / len(fov_d_fov)
+            metrics["fov/dist_cen_gt"] = sum(fov_d_cen) / len(fov_d_cen)
     return metrics
 
 
