@@ -1,58 +1,182 @@
-# Telescope — Learnable Hyperbolic Foveation
+# Telescope — Hyperbolic Foveation for Drone Detection
 
-Implementation of **"Telescope: Learnable Hyperbolic Foveation for Ultra-Long-Range Object Detection"**  
-Ewen et al., 2026 · [arXiv:2604.06332](https://arxiv.org/abs/2604.06332) · [Project page](https://light.princeton.edu/telescope)
+A drone detector that **"zooms in" on what matters** before looking, based on the paper
+*"Telescope: Learnable Hyperbolic Foveation for Ultra-Long-Range Object Detection"*
+(Ewen et al., 2026 · [arXiv:2604.06332](https://arxiv.org/abs/2604.06332) ·
+[project page](https://light.princeton.edu/telescope)).
 
 ---
 
-## Installation
+## The idea in 1 minute
 
-### Quick start — one script does everything
+A faraway drone is just a handful of pixels — too few for a detector to recognise. Instead of
+making the whole image bigger (expensive), we copy a trick from **the human eye**: your eye only
+sees sharply in the centre (the *fovea*) and blurry at the edges, so you move your eyes to put
+what matters in the centre.
+
+We do the same to the image with a **"lens"** (a differentiable warp): it spends more pixels on
+the region of interest and squashes the rest.
+
+![Foveation: a uniform grid for the network = dense sampling at the centre of the real image](_doc_assets/fov_grid.png)
+
+The lens has only **2 knobs**:
+
+- **`o`** — *where* to look (the centre of the lens)
+- **`R`** — *how much* to magnify (the radius / zoom)
+
+A tiny network (the **"scout"**) looks at a small version of the image and predicts `(o, R)`;
+the lens warps the image; a frozen **backbone** extracts features; a **DETR head** turns those
+into boxes. Everything is differentiable, so the scout *learns where to aim* from the detection
+error.
+
+![Pipeline: image → scout (o,R) → lens Φ → frozen backbone → DETR head → boxes](_doc_assets/pipeline.png)
+
+> A longer, slide-by-slide explanation (in Spanish, for a mixed audience) is in
+> **`Foveacion_Hiperbolica_Drones.pptx`**. The notebooks below build the whole thing from scratch.
+
+---
+
+## Install
 
 ```bash
-git clone https://github.com/your-user/telescope
-cd telescope
-chmod +x install.sh
-./install.sh
+git clone <repo> && cd hyperbolic_foveation_telescope_learn
+./install.sh            # interactive: venv + deps + backbone + (optional) data + self-test
 ```
 
-`install.sh` is interactive and handles the whole setup:
-1. Creates the `.telescope` virtual environment
-2. Installs core dependencies (and optionally the training extras)
-3. Downloads a backbone — **asks if you've been approved for SAM 3.1**; if yes it asks for
-   your HuggingFace token and downloads it, otherwise it falls back to SAM 2.1 automatically
-4. Optionally downloads the Argoverse 2 dataset
-5. Runs a self-test to confirm everything works
-
-It is safe to re-run — completed steps are skipped.
-
-### Manual install (if you prefer)
+Or by hand:
 
 ```bash
-python -m venv .telescope
-source .telescope/bin/activate        # Windows: .telescope\Scripts\activate
+python -m venv .telescope && source .telescope/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt       # core: enough for notebooks 01–06
+pip install -r requirements.txt          # core: package + notebooks
 pip install -e .
-pip install -r requirements-train.txt # extras: only for train.py / eval.py on real data
+pip install -r requirements-train.txt    # extras: only for train.py / eval.py
 ```
 
-| File | When you need it |
-|---|---|
-| `requirements.txt` | always — runs the package and all notebooks |
-| `requirements-train.txt` | only to train/evaluate on real data (`transformers`, `av2`, `pycocotools`) |
+The lightweight **EfficientTAM** backbone (used for drone training) and large model checkpoints
+are not tracked by git — see the *Backbones & offline install* section below to set them up.
 
-### Backbone & data details
+---
 
-The `install.sh` script automates the steps below; they are documented here for reference.
+## How to run
+
+### 1. Learn how it works (notebooks)
+
+```bash
+source .telescope/bin/activate && jupyter notebook
+```
+
+Six notebooks tell one story — *building a digital telescope* — and run on a laptop CPU
+(notebooks 01–05 use tiny stand-in models; 06 analyses real results after training):
+
+| # | Notebook | Step |
+|---|---|---|
+| 01 | `01_geometric_engine.ipynb` | The lens maths: Φ, Φ⁻¹, Jacobian |
+| 02 | `02_foveation_warp.ipynb` | Warping the image (`grid_sample`) |
+| 03 | `03_hyperbolic_embedding.ipynb` | Telling the detector the lens settings |
+| 04 | `04_detection_head.ipynb` | Boxes, gIoU loss, denoising |
+| 05 | `05_full_pipeline.ipynb` | The full model + Hungarian matching |
+| 06 | `06_results_analysis.ipynb` | Metrics, by-distance plots, with/without foveation |
+
+### 2. Train on a drone dataset (YOLO format)
+
+Point `--data_dir`/`--val_dir` at the dataset **root** (it finds `train/` and `val/`).
+Labels are `class cx cy w h` in `[0,1]`; images without a label file are background negatives.
+
+```bash
+torchrun --nproc_per_node=2 train.py \
+    --dataset drones \
+    --data_dir /path/to/drones_v5 --val_dir /path/to/drones_v5 \
+    --backbone efficienttam --backbone_ckpt ./checkpoints/efficienttam_s.pt \
+    --image_size 512 512 --batch_size 32 --epochs 60 --lr 2e-4 --fp16 \
+    --output_dir ./runs/drones 2>&1 | tee runs/drones/train.log
+```
+
+Single GPU: drop `torchrun --nproc_per_node=2` and use `python train.py ...` with a smaller
+`--batch_size`. Per-epoch metrics, `results.csv`, `results.png` and a `foveation:` diagnostic
+line are written to `--output_dir`.
+
+### 3. Evaluate
+
+```bash
+python eval.py --dataset drones \
+    --data_dir /path/to/drones_v5 \
+    --checkpoint ./runs/drones/checkpoint_best.pt \
+    --image_size 512 512        # MUST match training resolution
+```
+
+> ⚠️ Always pass the **same `--image_size` you trained with**. The default (1024²) on a model
+> trained at 512² feeds the backbone 4× the tokens it saw → near-zero mAP (a measurement
+> artefact, not a real result).
+
+---
+
+## Making the foveation lens actually work (drone-specific)
+
+On drone data the lens tends to **collapse** (it learns `R → 0`, i.e. "don't zoom") because the
+default loss never rewards a large `R`, ~half the frames are empty, and a single global `o`
+can't point at drones that appear anywhere. These flags counter that:
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--fov_spatial` | off | Predict `o` per-image via a soft-argmax heatmap (instead of a constant) |
+| `--fov_empty_weight` | `0.0` | Weight of the empty-frame term. `0` = don't supervise the lens on no-drone frames |
+| `--fov_w_r` / `--fov_r_lo` / `--fov_r_hi` | `1.0`/`0.05`/`0.40` | Pull `R` toward a **size-based target**: small drones ask for a bigger lens |
+| `--fov_r_floor` / `--fov_w_floor` | `0.05`/`1.0` | Anti-collapse hinge that keeps `R` off zero |
+| `--fov_warmup_epochs` / `--fov_warmup_R` | `3`/`0.3` | Hold `R` fixed & large early so the head learns to use zoom |
+| `--fov_lr_mult` | `5.0` | Train the scout faster than the rest of the net |
+| `--bg_keep_frac` | `1.0` | Keep only this fraction of background (no-drone) train images (e.g. `0.5`) |
+
+Recommended drone run (add to the train command above):
+
+```bash
+    --fov_spatial --fov_warmup_epochs 3 --fov_warmup_R 0.3 --fov_lr_mult 5 \
+    --fov_empty_weight 0 --bg_keep_frac 0.5
+```
+
+It is working if, in the `foveation:` log line, `fov/R_mean` stays well above 0, `fov/dist_to_gt`
+drops below the static-centre baseline, and `fov/o_x_std` rises (proves `o` varies per image).
+
+### Ablation: with vs without the lens
+
+```bash
+python train.py ... --no_foveation --output_dir ./runs/baseline   # R≈0 → Φ = identity
+python compare.py --runs ./runs/baseline ./runs/drones --labels "No lens" "Telescope"
+```
+
+---
+
+## Backbones & offline install
+
+| `--backbone` | Encoder | Params | Use for |
+|---|---|---|---|
+| `efficienttam` | EfficientTAM ViT-S | ~22M | Edge / real-time, drone training |
+| `sam3` *(default)* | SAM 3.1 ViT | 453M | Maximum accuracy (server) |
+
+<details>
+<summary><b>EfficientTAM backbone (lightweight)</b></summary>
+
+```bash
+git clone https://github.com/yformer/EfficientTAM       # or use the EfficientTAM/ in the repo
+pip install -e EfficientTAM --no-build-isolation --no-deps
+pip install hydra-core omegaconf iopath
+python - <<'EOF'
+from huggingface_hub import hf_hub_download
+hf_hub_download(repo_id="yunyangx/efficient-track-anything",
+                filename="efficienttam_s.pt", local_dir="checkpoints")
+EOF
+```
+
+The editable install is **per-environment and not tracked by git**. On every machine you train
+on you must (1) make `EfficientTAM/` present, (2) re-run `pip install -e EfficientTAM ...`,
+(3) copy `efficienttam_s.pt` into `checkpoints/`. A good load prints
+`[backbone] loaded 153 EfficientTAM encoder weights`.
+</details>
 
 <details>
 <summary><b>SAM 3.1 backbone (gated — needs Meta approval)</b></summary>
 
-1. Request access at **https://huggingface.co/facebook/sam3.1** (fill the form → Meta approves).
-2. Create a **classic** Read token at huggingface.co/settings/tokens (or a fine-grained token
-   with *"Access public gated repos"* enabled), then `hf auth login`.
-3. Download (~3.5 GB) — note the filename is `sam3.1_multiplex.pt`:
+Request access at https://huggingface.co/facebook/sam3.1, `hf auth login`, then:
 
 ```bash
 git clone https://github.com/facebookresearch/sam3 && pip install -e sam3
@@ -61,242 +185,59 @@ from huggingface_hub import hf_hub_download
 hf_hub_download(repo_id="facebook/sam3.1", filename="sam3.1_multiplex.pt", local_dir="checkpoints")
 EOF
 ```
+Public fallback while waiting: `pip install sam2` + `sam2.1_hiera_large.pt`.
 </details>
 
 <details>
-<summary><b>SAM 2.1 fallback (public, no approval)</b></summary>
+<summary><b>Air-gapped server (no internet)</b></summary>
+
+Pre-download wheels on a connected machine into `wheels_offline/`, rsync the repo (excluding the
+non-portable `.telescope` venv), then:
 
 ```bash
-pip install sam2
-wget https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt \
-     -O checkpoints/sam2.1_hiera_large.pt
+pip install --no-index --find-links wheels_offline \
+    hydra-core omegaconf antlr4-python3-runtime iopath portalocker
+pip install -e EfficientTAM --no-index --no-build-isolation --no-deps
 ```
-Same ViT-H backbone family — a drop-in substitute while waiting for SAM 3.1 approval.
+
+The server copy is a plain rsync (not a git repo); the package is `pip install -e .` so editing
+source files takes effect live. Copy backbone checkpoints into `checkpoints/` separately.
 </details>
 
 <details>
-<summary><b>Argoverse 2 dataset (TruckDrive substitute)</b></summary>
-
-TruckDrive (the paper's dataset, up to 1 km) is not yet public. Argoverse 2 covers up to
-~250 m in the same format:
+<summary><b>Argoverse 2 (the original cars-on-highway dataset)</b></summary>
 
 ```bash
 pip install av2
 python -m av2.datasets.sensor.download --target_dir ./data/argoverse2
+# train/eval with: --dataset argoverse2 --data_dir ./data/argoverse2/sensor/train
 ```
 </details>
-
----
-
-## Notebooks (the learning path)
-
-Six notebooks tell one continuous story — *building a digital telescope*. Run them in order;
-each one explains how its step builds on the last. They are written to be readable by
-non-experts while keeping the real maths and code.
-
-```bash
-source .telescope/bin/activate
-jupyter notebook
-```
-
-| # | Notebook | The story step | What you learn |
-|---|---|---|---|
-| 01 | `01_geometric_engine.ipynb` | Grind the lens | Φ, Φ⁻¹ (Newton-Raphson), Jacobian, Riemannian boxes |
-| 02 | `02_foveation_warp.ipynb` | Mount the lens | Differentiable image warp with `grid_sample` |
-| 03 | `03_hyperbolic_embedding.ipynb` | Calibrate it | Telling the detector the warp settings |
-| 04 | `04_detection_head.ipynb` | Read through it | Box head, gIoU, loss, denoising |
-| 05 | `05_full_pipeline.ipynb` | Assemble it | Full model, Hungarian matching, inference |
-| 06 | `06_results_analysis.ipynb` | Test if it sees farther | Metrics, distance plots, with-vs-without comparison |
-
-> **Notebooks 01–05** run on any laptop CPU (they use tiny stand-in models).
-> **Notebook 06** is the post-training analysis — it shows real results once you've trained,
-> and runs in a clearly-labelled demo mode before then so you can preview the analysis.
-
----
-
-## Training
-
-### Single GPU (RTX 3500 Ada, 14 GB)
-
-```bash
-python train.py \
-    --data_dir ./data/argoverse2/sensor/train \
-    --val_dir  ./data/argoverse2/sensor/val \
-    --batch_size 2 \
-    --fp16
-```
-
-### Smaller GPU / smoke test (< 12 GB)
-
-The defaults are paper-scale (real backbone, 1024 px, batch 4) and want 12–24 GB.
-To check the pipeline runs end-to-end on a small GPU (stub backbone, ~3 GB VRAM):
-
-```bash
-python train.py \
-    --data_dir ./data/argoverse2/sensor/train \
-    --val_dir  ./data/argoverse2/sensor/val \
-    --batch_size 1 --image_size 256 256 --fp16
-```
-
-This is a functional check, not a quality run: without the real SAM 3.1 backbone
-and the full dataset, mAP stays near zero (expected, not a bug). `train.py` prints
-these flags as a hint if it hits CUDA OOM.
-
-### 2× GPU — DDP (server with 2× 24 GB)
-
-```bash
-torchrun --nproc_per_node=2 train.py \
-    --data_dir ./data/argoverse2/sensor/train \
-    --val_dir  ./data/argoverse2/sensor/val \
-    --batch_size 4 \
-    --fp16
-```
-
-### Resume from checkpoint
-
-```bash
-python train.py \
-    --data_dir ./data/argoverse2/sensor/train \
-    --val_dir  ./data/argoverse2/sensor/val \
-    --resume   ./runs/run_01 \
-    --fp16
-```
-
-### With SAM3.1 backbone (once downloaded)
-
-```bash
-python train.py \
-    --data_dir       ./data/argoverse2/sensor/train \
-    --val_dir        ./data/argoverse2/sensor/val \
-    --backbone_ckpt  ./checkpoints/sam3.1_multiplex.pt \
-    --fp16
-```
-
-### Key hyperparameters (paper defaults)
-
-| Parameter | Default | Notes |
-|---|---|---|
-| `--lr` | 1e-4 | AdamW, lambda schedule with 1 warm-up epoch |
-| `--batch_size` | 4 | Per GPU. Use 2 on 14 GB VRAM |
-| `--epochs` | 12 | Fine-tune from backbone checkpoint |
-| `--image_size` | 1024 1024 | Paper resolution |
-| `--num_queries` | 300 | DETR object queries |
-| `--query_dim` | 256 | Query / embedding dimension |
-| `--fp16` | flag | Mixed precision — strongly recommended |
-
----
-
-## Validation
-
-Run on the val split and print COCO mAP:
-
-```bash
-python eval.py \
-    --data_dir  ./data/argoverse2/sensor/val \
-    --checkpoint ./runs/run_01/checkpoint_best.pt
-```
-
-Expected metrics on Argoverse 2 (from the paper, TruckDrive numbers):
-
-| Method | mAP | mAP₅₀ | mAP₀₋₅₀ | mAP₅₀₋₁₅₀ | mAP₁₅₀₋₂₅₀ | mAP₂₅₀₊ |
-|---|---|---|---|---|---|---|
-| Deformable DETR | 0.166 | 0.335 | 0.396 | 0.178 | 0.081 | 0.072 |
-| DINO | 0.222 | 0.405 | 0.335 | 0.239 | 0.189 | 0.179 |
-| **Telescope (ours)** | **0.497** | **0.801** | **0.608** | **0.507** | **0.335** | **0.326** |
-
----
-
-## Test
-
-Run on the test split:
-
-```bash
-python eval.py \
-    --data_dir   ./data/argoverse2/sensor/test \
-    --checkpoint ./runs/run_01/checkpoint_best.pt \
-    --split test
-```
-
-Results are saved to `runs/run_01/test_results.json` in COCO format.
-
----
-
-## Comparison: Telescope vs baseline (no foveation)
-
-To train and compare a baseline Deformable DETR **without** the hyperbolic foveation layer:
-
-```bash
-# Baseline: disable foveation (R → 0 makes Phi = identity everywhere)
-python train.py \
-    --data_dir    ./data/argoverse2/sensor/train \
-    --val_dir     ./data/argoverse2/sensor/val \
-    --output_dir  ./runs/baseline \
-    --no_foveation \
-    --fp16
-
-# Telescope (default)
-python train.py \
-    --data_dir   ./data/argoverse2/sensor/train \
-    --val_dir    ./data/argoverse2/sensor/val \
-    --output_dir ./runs/telescope \
-    --fp16
-
-# Compare
-python compare.py \
-    --runs ./runs/baseline ./runs/telescope \
-    --labels "No foveation" "Telescope"
-```
-
-The `--no_foveation` flag fixes R to a near-zero constant so `w(r) = 0`
-everywhere and `Φ(x) = x` — the model becomes standard Deformable DETR
-with the same backbone, making the comparison ablation fair.
-
-> **Prefer an interactive analysis?** Open **`notebooks/06_results_analysis.ipynb`**. It
-> loads your trained checkpoint(s), computes metrics, plots accuracy **by distance**, and
-> shows the with-vs-without-foveation comparison with rendered detections. It even runs
-> before you've trained (in a clearly-labelled demo mode) so you can preview the analysis.
 
 ---
 
 ## Package structure
 
 ```
-telescope/                  the importable package (single source of truth)
-├── geometry.py     Φ, Φ⁻¹, J_Φ, validate_inversion
-├── box.py          Euclidean ↔ Riemannian box encode/decode
-├── warp.py         FoveationWarpLayer
-├── estimator.py    FoveationEstimator FFN
-├── embedding.py    HyperbolicEmbedding + augment_queries
-├── head.py         RiemannianBoxHead, TelescopeLoss, gIoU, denoise_boxes
-├── matcher.py      HungarianMatcher, match_and_compute_loss
-├── eval.py         CocoEvaluator (mAP, mAP@50, per-distance bins)
-├── data.py         Argoverse2Dataset, collate_fn
-├── checkpoint.py   CheckpointManager (save/load/best-tracking/rotation)
-└── pipeline.py     TelescopeModel (full two-stage system)
-
-notebooks/                  the learning path (01–06, import from telescope/)
-
-train.py                    training script (single GPU + DDP, FP16, --no_foveation)
-eval.py                     evaluation script (COCO mAP)
-compare.py                  baseline comparison plots
-install.sh                  interactive installer (env + models + data)
-requirements.txt            core dependencies
-requirements-train.txt      training/eval extras
+telescope/                  the importable package
+├── geometry.py     Φ, Φ⁻¹, Jacobian                 ├── matcher.py    Hungarian + losses (incl. foveation loss)
+├── warp.py         FoveationWarpLayer (the lens)     ├── estimator.py  FoveationEstimator (the scout, o & R)
+├── embedding.py    HyperbolicEmbedding              ├── head.py       Riemannian box head + loss
+├── box.py          Euclidean ↔ Riemannian boxes     ├── eval.py       COCO mAP evaluator
+├── data_drones.py  DronesYoloDataset                 ├── data.py       Argoverse2Dataset
+├── backbone_efficienttam.py / backbone_sam3.py       └── pipeline.py   TelescopeModel (full system)
+notebooks/   the 01–06 learning path        train.py / eval.py / compare.py        install.sh
 ```
 
 ---
 
-## Hardware
+## Project status
 
-| Mode | GPU | Notes |
-|---|---|---|
-| Notebooks (stub) | CPU | No GPU needed |
-| Inference FP16 | 4 GB VRAM | Any modern GPU |
-| Training FP16, batch 2 | ~12 GB VRAM | RTX 3500 Ada 14 GB ✓ |
-| Training FP16, batch 4 | ~16 GB VRAM | RTX 3500 Ada (tight — use `--grad_accum 2`) |
-| Training FP16, batch 4 × 2 GPU | ~16 GB / GPU | 2 × 24 GB ✓ |
-
----
+This repo adapts Telescope to **drone detection** (single-class, YOLO data) on the
+`dev_efficienttam_backbone` branch. Latest training (`et66`) reached **mAP50-95 ≈ 0.17**
+(×4.5 over the first run); the foveation lens collapsed (`R → 0`), so the `--fov_*` flags above
+were added to make it actually zoom. The longer-term direction is a counter-drone (C-UAS) system:
+multi-class (drone/bird/airplane) + tracking + optical PTZ zoom.
 
 ## Citation
 

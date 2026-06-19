@@ -6,6 +6,7 @@
 #   1. Python virtual environment (.telescope)
 #   2. Core + optional training dependencies
 #   3. SAM 3.1 backbone (default) — or SAM 2.1 fallback
+#   3b. EfficientTAM lightweight backbone (optional — edge / drones)
 #   4. Argoverse 2 dataset (optional)
 #
 # Usage:
@@ -99,6 +100,8 @@ mkdir -p "$CKPT_DIR"
 
 SAM3_CKPT="${CKPT_DIR}/sam3.1_multiplex.pt"
 SAM2_CKPT="${CKPT_DIR}/sam2.1_hiera_large.pt"
+ET_CKPT="${CKPT_DIR}/efficienttam_s.pt"
+ET_DIR="${PROJECT_DIR}/EfficientTAM"
 
 download_sam3() {
     echo
@@ -169,6 +172,58 @@ download_sam2() {
     fi
 }
 
+# EfficientTAM: lightweight (~22M) edge/drone backbone. The package source lives
+# in EfficientTAM/ (gitignored, so NOT pulled with the repo) and must be installed
+# editable into THIS venv on every machine — see backbone_efficienttam.py / README.
+setup_efficienttam() {
+    # 1. Source package present? vendor it (gitignored → not pulled with the repo).
+    if [[ -d "$ET_DIR" ]]; then
+        ok "EfficientTAM source already present (EfficientTAM/)"
+    else
+        info "Fetching EfficientTAM source ..."
+        git clone --depth 1 https://github.com/yformer/EfficientTAM "$ET_DIR" \
+            || { err "EfficientTAM clone failed (need internet, or vendor EfficientTAM/ manually)."; return 1; }
+    fi
+
+    # 2. Runtime deps + editable install into the venv (so 'efficient_track_anything' imports).
+    info "Installing EfficientTAM runtime deps + package (editable) ..."
+    pip install --quiet hydra-core omegaconf iopath \
+        && pip install --quiet -e "$ET_DIR" --no-build-isolation --no-deps \
+        || { err "EfficientTAM package install failed."; return 1; }
+
+    # 3. Checkpoint (public — no HF token needed).
+    if [[ -f "$ET_CKPT" ]]; then
+        ok "EfficientTAM checkpoint already present — skipping"
+    else
+        info "Downloading efficienttam_s.pt (~140 MB, public) ..."
+        if python - <<'PYEOF'
+import sys
+from huggingface_hub import hf_hub_download
+try:
+    p = hf_hub_download(repo_id="yunyangx/efficient-track-anything",
+                        filename="efficienttam_s.pt", local_dir="checkpoints")
+    print(f"OK {p}")
+except Exception as e:
+    print(f"ERROR {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+        then
+            ok "EfficientTAM checkpoint downloaded"
+        else
+            err "EfficientTAM checkpoint download failed."
+            return 1
+        fi
+    fi
+
+    # 4. Confirm the package actually imports (the step people forget on new machines).
+    if python -c "import efficient_track_anything" 2>/dev/null; then
+        ok "EfficientTAM ready (import OK)"
+    else
+        err "efficient_track_anything not importable after install."
+        return 1
+    fi
+}
+
 if [[ -f "$SAM3_CKPT" ]]; then
     ok "SAM 3.1 checkpoint already present — skipping"
 elif [[ -f "$SAM2_CKPT" ]]; then
@@ -183,6 +238,16 @@ else
     else
         info "Skipped backbone download. The stub model runs without it."
     fi
+fi
+
+# ── EfficientTAM lightweight backbone (edge / drones) ──────────────────
+echo
+if [[ -f "$ET_CKPT" ]] && python -c "import efficient_track_anything" 2>/dev/null; then
+    ok "EfficientTAM backbone already set up — skipping"
+elif ask_yn "Set up the EfficientTAM lightweight backbone too (edge / drone training)?"; then
+    setup_efficienttam || warn "EfficientTAM setup incomplete — see messages above."
+else
+    info "Skipped EfficientTAM. (SAM backbone or the stub still works.)"
 fi
 
 # ──────────────────────────────────────────────────────────────────────
@@ -336,10 +401,18 @@ echo "Next steps:"
 echo "  source .telescope/bin/activate     # activate the environment"
 echo "  jupyter notebook                   # open notebooks 01–05 (learning path)"
 echo
-[[ -f "$SAM3_CKPT" ]] && echo "  Backbone: SAM 3.1  (checkpoints/sam3.1_multiplex.pt)"
-[[ -f "$SAM2_CKPT" ]] && echo "  Backbone: SAM 2.1  (checkpoints/sam2.1_hiera_large.pt)"
+[[ -f "$SAM3_CKPT" ]] && echo "  Backbone: SAM 3.1       (checkpoints/sam3.1_multiplex.pt)"
+[[ -f "$SAM2_CKPT" ]] && echo "  Backbone: SAM 2.1       (checkpoints/sam2.1_hiera_large.pt)"
+[[ -f "$ET_CKPT"   ]] && echo "  Backbone: EfficientTAM  (checkpoints/efficienttam_s.pt)"
 echo
-echo "  To train once data is ready:"
+echo "  To train on Argoverse 2 once data is ready:"
 echo "    python train.py --data_dir ./data/argoverse2/sensor/train \\"
 echo "                    --val_dir  ./data/argoverse2/sensor/val --fp16"
+if [[ -f "$ET_CKPT" ]]; then
+    echo
+    echo "  To train on a YOLO-format drone dataset with the lightweight backbone:"
+    echo "    python train.py --dataset drones --data_dir <yolo_root> --val_dir <yolo_root> \\"
+    echo "                    --backbone efficienttam --backbone_ckpt ./checkpoints/efficienttam_s.pt \\"
+    echo "                    --image_size 1024 1024 --batch_size 4 --epochs 4 --fp16"
+fi
 echo

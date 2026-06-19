@@ -167,7 +167,9 @@ def compute_jacobian(
 class HyperbolicInverseNR(torch.autograd.Function):
     """Differentiable Φ⁻¹ via Newton-Raphson + implicit-function-theorem backward.
 
-    Forward  : NR iteration x^{k+1} = x^k + η(y − Φ(x^k)) inside no_grad().
+    Forward  : Newton iteration x^{k+1} = x^k + η·J_Φ(x^k)^{−1}·(y − Φ(x^k))
+               inside no_grad().  η=1 is the full Newton step (quadratic
+               convergence); η<1 under-relaxes if a region is ill-conditioned.
     Backward : dL/dy = J_Φ(x*)^{−T}·dL/dx*, and (via the implicit function
                theorem) dL/do = −Φ_o^T·g, dL/dR = −Φ_R^T·g with g = dL/dy —
                so gradients flow to the foveation params, not only to y.
@@ -192,15 +194,25 @@ class HyperbolicInverseNR(torch.autograd.Function):
             x = y.clone()
             for _ in range(max_iter):
                 residual = y - hyperbolic_foveated_transform(x, o, R, alpha, p)
-                x = (x + eta * residual).clamp(-1.5, 1.5)
                 if residual.abs().max().item() < tol:
                     break
+                # Newton step: solve J_Φ(x)·Δx = residual  (closed-form 2×2),
+                # the same Jacobian solve the backward uses.  Quadratic
+                # convergence — replaces the old fixed-step Picard iteration
+                # x += η·residual, which stalled wherever ‖I − η·J_Φ‖ ≮ 1.
+                J = compute_jacobian(x, o, R, alpha, p)
+                delta = torch.linalg.solve(J, residual.unsqueeze(-1)).squeeze(-1)
+                x = (x + eta * delta).clamp(-1.5, 1.5)
             else:
-                warnings.warn(
-                    f"NR did not converge in {max_iter} iters. "
-                    f"Max residual: {residual.abs().max():.2e} (tol={tol:.2e})",
-                    RuntimeWarning,
-                )
+                # Re-evaluate after the final step so the report is accurate;
+                # only warn if it is genuinely still above tolerance.
+                residual = y - hyperbolic_foveated_transform(x, o, R, alpha, p)
+                if residual.abs().max().item() >= tol:
+                    warnings.warn(
+                        f"Newton did not converge in {max_iter} iters. "
+                        f"Max residual: {residual.abs().max():.2e} (tol={tol:.2e})",
+                        RuntimeWarning,
+                    )
         ctx.save_for_backward(x, o, R)
         ctx.alpha, ctx.p = alpha, p
         return x
@@ -245,11 +257,13 @@ def hyperbolic_inverse(
     R: Tensor,
     alpha: float = 2.0,
     p: float = 2.0,
-    eta: float = 0.5,
+    eta: float = 1.0,
     max_iter: int = 50,
     tol: float = 1e-6,
 ) -> Tensor:
     """Functional interface: x* = Φ⁻¹(y).   Eq.(3).
+
+    Solved by Newton-Raphson (full step η=1 → quadratic convergence).
 
     Differentiable — gradients flow via the implicit function theorem.
     """

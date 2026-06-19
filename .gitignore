@@ -17,6 +17,14 @@ data/
 # ── Third-party cloned repos ──────────────────────────────────────────
 sam3/
 sam2/
+EfficientTAM/
+
+# ── Offline wheel cache (regenerable, platform-specific binaries) ──────
+wheels_offline/
+
+# ── Didactic doc generator output (regenerable) ───────────────────────
+_doc_assets/
+generate_telescope_doc.py
 
 # ── Training outputs ──────────────────────────────────────────────────
 runs/
@@ -48,3 +56,11 @@ comparison.png
 .idea/
 .vscode/
 *.swp
+
+# Offline EfficientTAM bundle (built by ship_efficienttam_offline.sh)
+efficienttam_offline_bundle/
+
+# air-gapped server sync artifacts
+telescope_efficienttam_files.tar.gz
+telescope_trainlog_files.tar.gz
+telescope_et67_files.tar.gz

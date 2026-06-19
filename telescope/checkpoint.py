@@ -54,10 +54,15 @@ class CheckpointManager:
         epoch:     int,
         metrics:   dict,
         scaler:    Optional[object] = None,   # torch.cuda.amp.GradScaler
-    ) -> Path:
+        write_periodic: bool = True,
+    ) -> Optional[Path]:
         """Save a checkpoint and maintain the rotation window.
 
-        Returns the path of the saved file.
+        The best-by-metric checkpoint is ALWAYS updated when the metric improves.
+        The rotating ``checkpoint_epochXXXX.pt`` is only written when
+        ``write_periodic`` is True — pass False on epochs you want to skip to
+        keep disk use down (each file is ~250 MB).  Returns the periodic file
+        path, or None when it was skipped.
         """
         state = {
             "epoch":                epoch,
@@ -68,17 +73,20 @@ class CheckpointManager:
         if scaler is not None:
             state["scaler_state_dict"] = scaler.state_dict()
 
-        path = self.save_dir / f"checkpoint_epoch{epoch:04d}.pt"
-        torch.save(state, path)
-        print(f"[checkpoint] saved  → {path}  ({self.metric_key}={metrics.get(self.metric_key, 'n/a')})")
-
-        # Track best model separately
+        # Track best model separately — always, regardless of write_periodic.
         metric_val = metrics.get(self.metric_key, -float("inf"))
         if metric_val > self._best_metric:
             self._best_metric = metric_val
             best_path = self.save_dir / "checkpoint_best.pt"
             torch.save(state, best_path)
             print(f"[checkpoint] new best → {best_path}  ({self.metric_key}={metric_val:.4f})")
+
+        if not write_periodic:
+            return None
+
+        path = self.save_dir / f"checkpoint_epoch{epoch:04d}.pt"
+        torch.save(state, path)
+        print(f"[checkpoint] saved  → {path}  ({self.metric_key}={metrics.get(self.metric_key, 'n/a')})")
 
         # Rotation: delete oldest if over keep_last
         self._rotate()

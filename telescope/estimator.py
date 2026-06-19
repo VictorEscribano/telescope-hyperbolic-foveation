@@ -38,8 +38,10 @@ class FoveationEstimator(nn.Module):
         hidden      : width of the two hidden layers  [paper: 256]
     """
 
-    def __init__(self, in_features: int = 256, hidden: int = 256) -> None:
+    def __init__(self, in_features: int = 256, hidden: int = 256,
+                 feat_ch: int = 256, spatial_o: bool = False) -> None:
         super().__init__()
+        self.spatial_o = spatial_o
         self.mlp = nn.Sequential(
             nn.Linear(in_features, hidden),
             nn.ReLU(),
@@ -47,18 +49,52 @@ class FoveationEstimator(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden, 4),   # → [o_x_logit, o_y_logit, R_x_logit, R_y_logit]
         )
+        # Spatial head for `o`: a 1×1 conv produces a per-location score map; a
+        # soft-argmax over it gives a centre that CAN vary per image.  Without
+        # this, `o` comes from globally-pooled features (no spatial info) and can
+        # only learn a constant — the collapse observed in drones_et65/et66.
+        if spatial_o:
+            self.o_head = nn.Sequential(
+                nn.Conv2d(feat_ch, hidden, kernel_size=1),
+                nn.ReLU(),
+                nn.Conv2d(hidden, 1, kernel_size=1),
+            )
 
-    def forward(self, features: Tensor):
+    def _soft_argmax(self, feat_map: Tensor) -> Tensor:
+        """Soft-argmax of a learned heatmap → centre o in (−1, 1)².
+
+        Args:
+            feat_map : (B, C, H, W) finest encoder feature map
+        Returns:
+            (B, 2) in (−1, 1)²  (computed in fp32 for a stable softmax)
+        """
+        heat = self.o_head(feat_map).float()                  # (B, 1, H, W)
+        B, _, H, W = heat.shape
+        prob = F.softmax(heat.view(B, -1), dim=-1).view(B, 1, H, W)
+        xs = torch.linspace(-1.0, 1.0, W, device=heat.device, dtype=heat.dtype)
+        ys = torch.linspace(-1.0, 1.0, H, device=heat.device, dtype=heat.dtype)
+        px = prob.sum(dim=2).squeeze(1)                       # (B, W) marginal over rows
+        py = prob.sum(dim=3).squeeze(1)                       # (B, H) marginal over cols
+        o_x = (px * xs).sum(dim=-1)
+        o_y = (py * ys).sum(dim=-1)
+        return torch.stack([o_x, o_y], dim=-1)                # (B, 2)
+
+    def forward(self, features: Tensor, feat_map: Tensor = None):
         """Predict foveation parameters from encoder features.
 
         Args:
-            features : (B, in_features)
+            features : (B, in_features)  globally-pooled feature vector (drives R)
+            feat_map : (B, C, H, W)      finest feature map (drives spatial o);
+                                         required when ``spatial_o=True``
         Returns:
             o : (B, 2) foveation centre in (−1, 1)²
             R : (B,)   radial scale > 0
         """
         logits = self.mlp(features)                           # (B, 4)
-        o      = torch.tanh(logits[:, :2])                    # (B, 2)
         R_xy   = F.softplus(logits[:, 2:])                    # (B, 2) > 0
         R      = R_xy.max(dim=-1).values                      # (B,)
+        if self.spatial_o and feat_map is not None:
+            o = self._soft_argmax(feat_map).to(logits.dtype)  # (B, 2) per-image
+        else:
+            o = torch.tanh(logits[:, :2])                     # (B, 2)
         return o, R

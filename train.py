@@ -18,7 +18,9 @@ Key hyperparameters match paper Table 9:
 """
 
 import argparse
+import math
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -31,18 +33,36 @@ import torch.distributed as dist
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, DistributedSampler
 
+# Input shapes are static here (fixed --image_size and --batch_size), so let
+# cuDNN benchmark/autotune the best conv algorithms once and reuse them. And on
+# Ampere+ (e.g. A10) allow TF32 for the fp32 matmuls in the geometry path — the
+# detector runs in fp16 and the SAM3 backbone in bf16, so neither is affected;
+# only the otherwise-slow fp32 Newton-Raphson/Jacobian matmuls speed up.
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 from telescope.pipeline import TelescopeModel
 from telescope.matcher import (HungarianMatcher, match_and_compute_loss,
-                               compute_denoising_loss, compute_encoder_aux_loss)
+                               compute_denoising_loss, compute_encoder_aux_loss,
+                               compute_foveation_loss)
 from telescope.eval import CocoEvaluator, DetectionResult, DISTANCE_BINS
-from telescope.data import Argoverse2Dataset, collate_fn, NUM_CLASSES, CLASS_NAMES
+from telescope.data import collate_fn
 from telescope.checkpoint import CheckpointManager
+from telescope.trainlog import MetricsLogger
+
+from tqdm import tqdm
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--dataset",     type=str, default="argoverse2",
+                   choices=["argoverse2", "drones"],
+                   help="argoverse2 (3D→2D) or drones (YOLO-format 2D). For "
+                        "drones, point --data_dir and --val_dir both at the "
+                        "dataset root (the loader picks the train/ and val/ subdirs).")
     p.add_argument("--data_dir",    type=str, required=True)
     p.add_argument("--val_dir",     type=str, required=True)
     p.add_argument("--output_dir",  type=str, default="./runs/run_01")
@@ -58,12 +78,27 @@ def parse_args():
     p.add_argument("--grad_clip",   type=float, default=0.1)
     p.add_argument("--resume",      type=str, default=None,
                    help="path to checkpoint dir to resume from")
+    p.add_argument("--backbone", type=str, default="sam3",
+                   choices=["sam3", "efficienttam"],
+                   help="which frozen backbone to load when --backbone_ckpt is given. "
+                        "sam3 = SAM 3.1 (453M, max accuracy); efficienttam = "
+                        "EfficientTAM ViT (~10-40× lighter, edge real-time).")
     p.add_argument("--backbone_ckpt", type=str, default=None,
-                   help="path to SAM3.1 checkpoint (optional — uses stub if not given)")
+                   help="path to the backbone checkpoint (optional — uses stub if not "
+                        "given). SAM3.1: sam3.1_multiplex.pt; EfficientTAM: efficienttam_s.pt")
+    p.add_argument("--et_config", type=str,
+                   default="configs/efficienttam/efficienttam_s.yaml",
+                   help="EfficientTAM Hydra config (variant): *_s.yaml (1024, accuracy) "
+                        "or *_s_512x512.yaml / *_ti*.yaml (faster, edge)")
     p.add_argument("--no_foveation", action="store_true", default=False,
                    help="disable foveation (R fixed near zero) for ablation baseline")
     p.add_argument("--grad_accum",   type=int, default=1,
                    help="gradient accumulation steps (use 2 on 14GB VRAM for effective batch=4)")
+    p.add_argument("--save_every",   type=int, default=1,
+                   help="write a rotating epoch checkpoint every N epochs (each ~250MB). "
+                        "checkpoint_best.pt is always kept up to date regardless.")
+    p.add_argument("--keep_last",    type=int, default=3,
+                   help="how many recent epoch checkpoints to keep on disk (older deleted)")
     p.add_argument("--denoising",    action="store_true", default=True,
                    help="DINO-style denoising auxiliary loss (paper §4)")
     p.add_argument("--no_denoising", dest="denoising", action="store_false",
@@ -78,6 +113,50 @@ def parse_args():
                    help="disable two-stage; use 300 learned object queries (one-stage)")
     p.add_argument("--enc_weight",   type=float, default=1.0,
                    help="weight of the two-stage encoder auxiliary loss")
+    p.add_argument("--fov_weight",   type=float, default=2.0,
+                   help="weight of the foveation-supervision loss (pulls the lens "
+                        "centre o toward the GT centroid). 0 disables it.")
+    p.add_argument("--fov_empty_weight", type=float, default=0.0,
+                   help="relative weight, inside the foveation loss, of the empty-"
+                        "image term (o→centre on no-drone frames). Default 0 = do "
+                        "NOT supervise the lens on empty frames (stops R-collapse).")
+    p.add_argument("--fov_w_r",      type=float, default=1.0,
+                   help="relative weight of the R→size-target term (gives R a "
+                        "reason to GROW: small drones ask for a larger lens)")
+    p.add_argument("--fov_w_floor",  type=float, default=1.0,
+                   help="relative weight of the anti-collapse hinge relu(r_floor−R)")
+    p.add_argument("--fov_r_lo",     type=float, default=0.05,
+                   help="R target for large drones (lower bound of the size→R map)")
+    p.add_argument("--fov_r_hi",     type=float, default=0.40,
+                   help="R target for tiny drones (upper bound of the size→R map)")
+    p.add_argument("--fov_s_ref",    type=float, default=1.0,
+                   help="object linear size (in [-1,1] units) at which R target → r_lo")
+    p.add_argument("--fov_r_floor",  type=float, default=0.05,
+                   help="anti-collapse floor: R is penalised below this value")
+    p.add_argument("--fov_spatial",  action="store_true", default=False,
+                   help="predict o via soft-argmax over a spatial heatmap (per-image) "
+                        "instead of from globally-pooled features (a constant)")
+    p.add_argument("--fov_warmup_epochs", type=int, default=3,
+                   help="curriculum: force R=--fov_warmup_R for this many initial "
+                        "epochs so the head learns to use magnified features (0 off)")
+    p.add_argument("--fov_warmup_R", type=float, default=0.3,
+                   help="fixed R used during the foveation warm-up epochs")
+    p.add_argument("--fov_lr_mult",  type=float, default=5.0,
+                   help="LR multiplier for the FoveationEstimator (scout) params so "
+                        "the lens adapts faster than the rest of the net")
+    p.add_argument("--bg_keep_frac", type=float, default=1.0,
+                   help="fraction of background (no-drone) TRAIN images to keep "
+                        "(e.g. 0.5 halves them to rebalance; 1.0 keeps all)")
+    p.add_argument("--lr_min_ratio", type=float, default=0.01,
+                   help="cosine-decay floor as a fraction of --lr (LR decays from "
+                        "lr after warm-up down to lr*lr_min_ratio by the last epoch)")
+    p.add_argument("--patience",     type=int, default=15,
+                   help="early-stop after this many epochs with no mAP improvement "
+                        "(0 disables). The best checkpoint is kept regardless.")
+    p.add_argument("--eos_coef",     type=float, default=0.1,
+                   help="down-weight of the no-object class in the cls loss. Lower "
+                        "(e.g. 0.05) favours recall on imbalanced sets (drones: "
+                        "~half the frames are bird hard-negatives).")
     return p.parse_args()
 
 
@@ -101,12 +180,22 @@ def main():
     rank, world_size, device = setup_ddp()
     is_main    = (rank == 0)
 
+    # ── Dataset + class set selection ─────────────────────────────────────────
+    if args.dataset == "drones":
+        from telescope.data_drones import (DronesYoloDataset as DatasetCls,
+                                            DRONE_NUM_CLASSES as NUM_CLASSES,
+                                            DRONE_CLASS_NAMES as CLASS_NAMES)
+    else:
+        from telescope.data import (Argoverse2Dataset as DatasetCls,
+                                     NUM_CLASSES, CLASS_NAMES)
+
     # ── Model ─────────────────────────────────────────────────────────────────
     model = TelescopeModel(
         num_classes = NUM_CLASSES,
         num_queries = args.num_queries,
         query_dim   = args.query_dim,
         two_stage   = args.two_stage,
+        fov_spatial = args.fov_spatial,
     ).to(device)
 
     # Baseline ablation: fix R ≈ 0 so Phi(x) = x everywhere
@@ -116,9 +205,12 @@ def main():
             param.requires_grad_(False)
         model.fov_estimator._no_foveation = True   # checked in forward below
 
-    # Optionally load real SAM3.1 backbone
+    # Optionally load a real (frozen) backbone in place of the stub.
     if args.backbone_ckpt:
-        _load_sam3_backbone(model, args.backbone_ckpt, device)
+        if args.backbone == "efficienttam":
+            _load_efficienttam_backbone(model, args.backbone_ckpt, device, args.et_config)
+        else:
+            _load_sam3_backbone(model, args.backbone_ckpt, device)
 
     # Freeze backbone
     for p in model.backbone.parameters():
@@ -133,8 +225,20 @@ def main():
         )
 
     # ── Optimizer + scheduler ─────────────────────────────────────────────────
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=args.lr,
+    # Two param groups: the FoveationEstimator (scout) gets a higher LR so the
+    # lens adapts faster than the rest (it collapsed partly from learning too
+    # slowly).  Each group carries an ``lr_scale`` honoured by set_lr below.
+    fov_params, other_params = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (fov_params if "fov_estimator" in n else other_params).append(p)
+    param_groups = [{"params": other_params, "lr": args.lr, "lr_scale": 1.0}]
+    if fov_params:
+        param_groups.append({"params": fov_params,
+                             "lr": args.lr * args.fov_lr_mult,
+                             "lr_scale": args.fov_lr_mult})
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr,
                                    weight_decay=args.weight_decay)
     # init_scale below the 2**16 default: the geometry runs in fp32 but the DETR
     # is fp16, and a lower starting scale avoids a few wasted overflow steps
@@ -142,7 +246,7 @@ def main():
     scaler    = GradScaler("cuda", enabled=args.fp16, init_scale=2**13)
 
     # ── Checkpoint manager ────────────────────────────────────────────────────
-    ckpt_mgr    = CheckpointManager(args.output_dir, keep_last=3)
+    ckpt_mgr    = CheckpointManager(args.output_dir, keep_last=args.keep_last)
     start_epoch = 0
     if args.resume:
         ckpt_mgr_resume = CheckpointManager(args.resume)
@@ -152,10 +256,13 @@ def main():
         )
 
     # ── Data loaders ──────────────────────────────────────────────────────────
-    train_ds = Argoverse2Dataset(args.data_dir, split="train",
-                                  image_size=tuple(args.image_size))
-    val_ds   = Argoverse2Dataset(args.val_dir,  split="val",
-                                  image_size=tuple(args.image_size))
+    train_kwargs = {}
+    if args.dataset == "drones" and args.bg_keep_frac < 1.0:
+        train_kwargs["bg_keep_frac"] = args.bg_keep_frac
+    train_ds = DatasetCls(args.data_dir, split="train",
+                          image_size=tuple(args.image_size), **train_kwargs)
+    val_ds   = DatasetCls(args.val_dir,  split="val",
+                          image_size=tuple(args.image_size))
 
     train_sampler = DistributedSampler(train_ds) if world_size > 1 else None
     train_loader  = DataLoader(
@@ -168,16 +275,23 @@ def main():
         num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
     )
 
-    # ── LR warm-up (paper Table 9: 1 warm-up epoch) ───────────────────────────
-    # Implemented as a per-iteration linear ramp over the first epoch, then
-    # constant.  The previous per-epoch LambdaLR evaluated the ramp at epoch
-    # index 0 → factor 1e-8, i.e. the entire first epoch trained at ~0 LR.
+    # ── LR schedule: linear warm-up (epoch 0) then cosine decay ───────────────
+    # Warm-up over the first epoch (paper Table 9), then cosine-anneal from lr
+    # down to lr*lr_min_ratio over the remaining steps.  The previous schedule
+    # held lr CONSTANT after warm-up, so the model never settled and validation
+    # bounced for 80 epochs without improving (see runs/drones_et65).
     warmup_iters = len(train_loader)
+    total_iters  = max(1, args.epochs * len(train_loader))
+    lr_floor     = args.lr * args.lr_min_ratio
     def set_lr(global_step: int) -> float:
-        scale = min(1.0, (global_step + 1) / max(1, warmup_iters))
-        lr = args.lr * scale
+        if global_step < warmup_iters:
+            lr = args.lr * (global_step + 1) / max(1, warmup_iters)
+        else:
+            progress = (global_step - warmup_iters) / max(1, total_iters - warmup_iters)
+            cos = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))   # 1 → 0
+            lr = lr_floor + (args.lr - lr_floor) * cos
         for g in optimizer.param_groups:
-            g["lr"] = lr
+            g["lr"] = lr * g.get("lr_scale", 1.0)
         return lr
     global_step = start_epoch * len(train_loader)
 
@@ -185,15 +299,44 @@ def main():
     matcher = HungarianMatcher(cost_cls=1.0, cost_l1=5.0, cost_giou=2.0)
 
     # ── Training loop ─────────────────────────────────────────────────────────
+    logger = MetricsLogger(args.output_dir, args.epochs) if is_main else None
+    best_map, epochs_no_improve = -1.0, 0   # early-stopping state (tracked on rank 0)
+
     for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         model.train()
-        epoch_loss = 0.0
-        t0 = time.time()
 
-        for step, (images, targets) in enumerate(train_loader):
+        # Foveation curriculum: force a fixed sizeable R for the first
+        # --fov_warmup_epochs so the head learns to exploit magnified features
+        # before R becomes learnable (then release it).  Set on the estimator and
+        # read inside the forward pass.
+        _fe = (model.module if world_size > 1 else model).fov_estimator
+        if (not args.no_foveation and args.fov_warmup_epochs > 0
+                and epoch < args.fov_warmup_epochs):
+            _fe._fixed_R = args.fov_warmup_R
+            if is_main and epoch == start_epoch:
+                print(f"[foveation] warm-up: R fixed to {args.fov_warmup_R} for "
+                      f"epochs <{args.fov_warmup_epochs}")
+        else:
+            _fe._fixed_R = None
+
+        epoch_loss = epoch_l1 = epoch_giou = epoch_cls = 0.0
+        t0 = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
+
+        pbar = train_loader
+        if is_main:
+            # Under `... | tee log`, stderr is not a TTY and tqdm writes one
+            # line PER refresh, flooding the log. Refresh ~once/min in that case
+            # (keeps train.log small/readable) and snappily on a real terminal.
+            _refresh = 0.5 if sys.stderr.isatty() else 60.0
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}",
+                        dynamic_ncols=True, leave=False, mininterval=_refresh)
+
+        for step, (images, targets) in enumerate(pbar):
             images = images.to(device)
             gt_boxes_list  = [t["boxes"].to(device)  for t in targets]
             gt_labels_list = [t["labels"].to(device) for t in targets]
@@ -222,6 +365,7 @@ def main():
                     boxes_ri, logits,
                     gt_boxes_list, gt_labels_list,
                     o, R, matcher, NUM_CLASSES,
+                    eos_coef=args.eos_coef,
                 )
                 total = losses["loss_total"]
 
@@ -245,6 +389,21 @@ def main():
                     total = total + args.enc_weight * enc["loss_enc"]
                     losses["n_enc"] = enc["n_enc"]
 
+                # Foveation supervision — pull the lens centre o toward the GT
+                # centroid (and o→centre, R→small on empty frames).  Without it
+                # the estimator collapses to a constant corner (runs/drones_et65).
+                if args.fov_weight > 0 and not args.no_foveation:
+                    fov = compute_foveation_loss(
+                        o, R, gt_boxes_list,
+                        w_empty=args.fov_empty_weight,
+                        w_r=args.fov_w_r, w_floor=args.fov_w_floor,
+                        r_lo=args.fov_r_lo, r_hi=args.fov_r_hi,
+                        s_ref=args.fov_s_ref, r_floor=args.fov_r_floor,
+                    )
+                    total = total + args.fov_weight * fov["loss_fov"]
+                    losses["loss_fov"] = fov["loss_fov"]
+                    losses["n_fov"]    = fov["n_fov"]
+
                 # scale loss for gradient accumulation
                 loss = total / args.grad_accum
 
@@ -259,51 +418,146 @@ def main():
             global_step += 1
 
             epoch_loss += losses["loss_total"].item()
+            epoch_l1   += losses["loss_l1"].item()
+            epoch_giou += losses["loss_giou"].item()
+            epoch_cls  += losses["loss_cls"].item()
 
-            if is_main and step % 50 == 0:
-                dn_str  = f"  dn={losses['n_dn']}"  if "n_dn"  in losses else ""
-                enc_str = f"  enc={losses['n_enc']}" if "n_enc" in losses else ""
-                print(f"  epoch {epoch:3d}  step {step:5d}/{len(train_loader)}  "
-                      f"loss={losses['loss_total'].item():.4f}  "
-                      f"matched={losses['n_matched']}{dn_str}{enc_str}")
+            if is_main:
+                n = step + 1
+                mem = (torch.cuda.max_memory_allocated(device) / 1e9
+                       if torch.cuda.is_available() else 0.0)
+                # refresh=False: just stash the postfix; let tqdm redraw on its
+                # own mininterval. Otherwise set_postfix_str forces a refresh
+                # every step and floods a tee'd (non-TTY) log regardless.
+                pbar.set_postfix_str(
+                    f"loss={epoch_loss / n:.3f} l1={epoch_l1 / n:.3f} "
+                    f"giou={epoch_giou / n:.3f} cls={epoch_cls / n:.3f} "
+                    f"mem={mem:.1f}G", refresh=False)
 
-        avg_loss = epoch_loss / len(train_loader)
+        nb = len(train_loader)
+        avg_loss = epoch_loss / nb
 
         # ── Validation ────────────────────────────────────────────────────────
         if is_main:
             metrics = _run_validation(
                 model if world_size == 1 else model.module,
-                val_loader, device
+                val_loader, device, NUM_CLASSES, CLASS_NAMES, matcher,
             )
             metrics["loss"] = avg_loss
             elapsed = time.time() - t0
-            print(f"epoch {epoch:3d}  loss={avg_loss:.4f}  "
-                  f"mAP={metrics.get('mAP', 0):.4f}  "
-                  f"mAP50={metrics.get('mAP_50', 0):.4f}  "
-                  f"time={elapsed:.0f}s")
-            # Per-distance-bin mAP (paper's headline metric), when available
+            gpu_mem = (torch.cuda.max_memory_allocated(device) / 1e9
+                       if torch.cuda.is_available() else 0.0)
+
+            # Ultralytics-style per-epoch row → console table + results.csv.
+            logger.log(epoch, {
+                "epoch":            epoch,
+                "time_s":           elapsed,
+                "lr":               optimizer.param_groups[0]["lr"],
+                "train/loss":       avg_loss,
+                "train/l1":         epoch_l1 / nb,
+                "train/giou":       epoch_giou / nb,
+                "train/cls":        epoch_cls / nb,
+                "val/loss":         metrics.get("val_loss", float("nan")),
+                "metrics/mAP50-95": metrics.get("mAP", 0.0),
+                "metrics/mAP50":    metrics.get("mAP_50", 0.0),
+                "metrics/recall":   metrics.get("recall", 0.0),
+            }, gpu_mem_gb=gpu_mem)
+
+            # Per-distance-bin mAP (paper's headline metric), when available.
             dist_bins = [f"{name}={metrics[f'mAP_{name}']:.3f}"
                          for name, _, _ in DISTANCE_BINS
                          if f"mAP_{name}" in metrics]
             if dist_bins:
                 print("           mAP by distance(m):  " + "  ".join(dist_bins))
+            # Foveation health: o spread (std≈0 ⇒ collapsed to a fixed point) and
+            # whether the lens beats a static centre at reaching the targets
+            # (dist_to_gt < dist_cen_gt ⇒ the warp is actually tracking drones).
+            if "fov/o_x_mean" in metrics:
+                line = ("           foveation: "
+                        f"o=({metrics['fov/o_x_mean']:+.3f},{metrics['fov/o_y_mean']:+.3f}) "
+                        f"std=({metrics['fov/o_x_std']:.3f},{metrics['fov/o_y_std']:.3f}) "
+                        f"R={metrics['fov/R_mean']:.3f}±{metrics['fov/R_std']:.3f}")
+                if "fov/dist_to_gt" in metrics:
+                    line += (f"  |o-gt|={metrics['fov/dist_to_gt']:.3f} "
+                             f"(centre={metrics['fov/dist_cen_gt']:.3f})")
+                print(line)
+            # Write a rotating checkpoint every --save_every epochs (and always
+            # on the last one); best is updated inside save() regardless.
+            periodic = (((epoch + 1) % args.save_every == 0)
+                        or (epoch + 1 == args.epochs))
             ckpt_mgr.save(
                 model if world_size == 1 else model.module,
-                optimizer, epoch, metrics, scaler
+                optimizer, epoch, metrics, scaler, write_periodic=periodic,
             )
+
+            # Early-stopping bookkeeping (the stop decision is synced below).
+            cur_map = metrics.get("mAP", 0.0)
+            if cur_map > best_map + 1e-6:
+                best_map, epochs_no_improve = cur_map, 0
+            else:
+                epochs_no_improve += 1
+
+        # ── Early stopping ────────────────────────────────────────────────────
+        # Only rank 0 validates, so the stop decision must be broadcast or the
+        # other ranks deadlock at the next DDP all-reduce.
+        if args.patience > 0:
+            stop = torch.tensor(
+                [1.0 if (is_main and epochs_no_improve >= args.patience) else 0.0],
+                device=device,
+            )
+            if world_size > 1:
+                dist.broadcast(stop, src=0)
+            if stop.item() > 0:
+                if is_main:
+                    print(f"[early-stop] no mAP improvement for {args.patience} "
+                          f"epochs (best mAP={best_map:.4f}); stopping at epoch {epoch}.")
+                break
+
+    if is_main and logger is not None:
+        logger.plot()
 
     if world_size > 1:
         dist.destroy_process_group()
 
 
 @torch.no_grad()
-def _run_validation(model, val_loader, device) -> dict:
+def _run_validation(model, val_loader, device, num_classes, class_names,
+                    matcher) -> dict:
     model.eval()
-    evaluator = CocoEvaluator(num_classes=NUM_CLASSES - 1,
-                               class_names=CLASS_NAMES[:-1])
+    evaluator = CocoEvaluator(num_classes=num_classes - 1,
+                               class_names=class_names[:-1])
+    val_loss, n_batches = 0.0, 0
+    # Foveation diagnostics: is the learned lens (o,R) tracking targets, or has
+    # it collapsed to a fixed point?  We accumulate (o,R) over the split and
+    # compare |o − GT-centroid| against |center(0,0) − GT-centroid| — a static
+    # centre lens.  If the learned foveation is no closer to the targets than a
+    # fixed centre, the warp adds nothing (the "vanishing-point prior" fails for
+    # drones, which appear anywhere).  See FoveationEstimator (single global o,R).
+    fov_o, fov_R          = [], []   # per-image centres (N,2) and radii (N,)
+    fov_d_fov, fov_d_cen  = [], []   # |o−GT_c| and |0−GT_c|, images with ≥1 GT
     for images, targets in val_loader:
         images = images.to(device)
-        boxes_eu, logits, o, R = model(images)
+        gt_boxes  = [t["boxes"].to(device)  for t in targets]
+        gt_labels = [t["labels"].to(device) for t in targets]
+
+        # Same forward as training (riemannian boxes) so the val loss is
+        # directly comparable to train loss; boxes_eu feed the COCO evaluator.
+        boxes_eu, logits, o, R, boxes_ri, _enc = model(images,
+                                                        return_riemannian=True)
+        losses = match_and_compute_loss(boxes_ri, logits, gt_boxes, gt_labels,
+                                        o, R, matcher, num_classes)
+        val_loss += losses["loss_total"].item()
+        n_batches += 1
+
+        fov_o.append(o.detach().float().cpu())
+        fov_R.append(R.detach().float().cpu())
+        for b in range(len(targets)):
+            gb = gt_boxes[b]
+            if gb.numel():                                # mean GT centre in [-1,1]
+                gt_c = gb[:, :2].mean(0).detach().float().cpu()
+                fov_d_fov.append((o[b, :2].detach().float().cpu() - gt_c).norm().item())
+                fov_d_cen.append(gt_c.norm().item())      # static-centre baseline
+
         probs  = logits.softmax(-1)[:, :, :-1]
         scores, labels = probs.max(-1)
         for b, target in enumerate(targets):
@@ -315,7 +569,23 @@ def _run_validation(model, val_loader, device) -> dict:
                                   target["image_id"])],
                 [target]
             )
-    return evaluator.summarize()
+    metrics = evaluator.summarize()
+    metrics["val_loss"] = val_loss / max(1, n_batches)
+
+    # ── Foveation diagnostics (extra keys; ignored by logger/checkpoint) ──────
+    if fov_o:
+        o_all = torch.cat(fov_o)                          # (N,2)
+        R_all = torch.cat(fov_R)                          # (N,)
+        metrics["fov/o_x_mean"] = o_all[:, 0].mean().item()
+        metrics["fov/o_y_mean"] = o_all[:, 1].mean().item()
+        metrics["fov/o_x_std"]  = o_all[:, 0].std(unbiased=False).item()
+        metrics["fov/o_y_std"]  = o_all[:, 1].std(unbiased=False).item()
+        metrics["fov/R_mean"]   = R_all.mean().item()
+        metrics["fov/R_std"]    = R_all.std(unbiased=False).item()
+        if fov_d_fov:
+            metrics["fov/dist_to_gt"]  = sum(fov_d_fov) / len(fov_d_fov)
+            metrics["fov/dist_cen_gt"] = sum(fov_d_cen) / len(fov_d_cen)
+    return metrics
 
 
 def _load_sam3_backbone(model, ckpt_path, device):
@@ -329,6 +599,22 @@ def _load_sam3_backbone(model, ckpt_path, device):
     model.backbone = real
     n = sum(p.numel() for p in real.parameters())
     print(f"[backbone] SAM3.1 vision encoder wired ({n/1e6:.0f}M params, will be frozen)")
+
+
+def _load_efficienttam_backbone(model, ckpt_path, device, config_file):
+    """Swap SAM3EncoderStub for the frozen EfficientTAM ViT image encoder."""
+    from telescope.backbone_efficienttam import EfficientTAMBackbone
+    print(f"[backbone] loading EfficientTAM image encoder from {ckpt_path} "
+          f"(config: {config_file}) ...")
+    real = EfficientTAMBackbone(
+        checkpoint_path=ckpt_path,
+        out_channels=model.backbone.out_channels,   # = query_dim (must be 256)
+        config_file=config_file,
+    ).to(device)
+    model.backbone = real
+    n = sum(p.numel() for p in real.parameters())
+    print(f"[backbone] EfficientTAM image encoder wired ({n/1e6:.0f}M params, "
+          f"will be frozen)")
 
 
 def _oom_hint(args):

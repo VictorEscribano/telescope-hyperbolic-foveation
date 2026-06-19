@@ -117,6 +117,51 @@ domine la cross-entropy de las queries.
 
 ---
 
+## ✅ COMPLETADO — anti-colapso de la foveación en drones (2026-06-19, et67)
+
+Tras et65/et66 (EfficientTAM, dataset de drones) la lupa **colapsaba**: et65 `o` pegada a una
+esquina; et66 `o`→centro y `R`→0 (deja de ampliar). Diagnóstico: (a) ninguna pérdida premiaba
+una `R` grande, (b) el término de imagen vacía empujaba `R`→0.01 en ~la mitad de los frames,
+(c) un único `o` global (de features promediadas) no puede localizar. El informe de tamaños
+(`drones_v5_cvlab_health.pdf`) mostró **mediana de caja = 0.6% del área** (drones pequeños
+dominan) → ampliar SÍ tiene sentido. 8 cambios (verificados con smoke test en CPU):
+
+### `telescope/matcher.py` — `compute_foveation_loss` reescrita
+- **Imágenes vacías ya no supervisan la lupa** (`w_empty=0` por defecto; eliminado el término
+  `R→r_empty` que era lo que más encogía la lupa).
+- **`R`-objetivo por tamaño** (`loss_fov_r`): de la caja más pequeña del frame,
+  `s=sqrt(w·h)` en unidades `[-1,1]`, `r_tgt=clamp(r_hi−(r_hi−r_lo)·s/s_ref, r_lo, r_hi)`.
+  Dron pequeño → `R` grande. **Es el término que le da a `R` un motivo para crecer.**
+- **Bisagra anti-colapso** `relu(r_floor−R)` en positivos.
+
+### `telescope/estimator.py` — `o` espacial (soft-argmax)
+`FoveationEstimator(..., feat_ch, spatial_o)`: con `spatial_o=True` añade un `o_head` (conv 1×1)
+que produce un heatmap sobre el mapa de features más fino → softmax → **soft-argmax** → `o`
+**por imagen** (en fp32 para estabilidad). `R` sigue saliendo del MLP sobre features pooled.
+
+### `telescope/pipeline.py`
+- `TelescopeModel(..., fov_spatial)` propaga el flag; el forward pasa el mapa fino
+  (`feats_low[-1]`) al estimador.
+- **Currículum**: lee `fov_estimator._fixed_R`; si está fijado, fuerza `R` constante (warm-up).
+
+### `telescope/data_drones.py` — submuestreo de fondo
+`bg_keep_frac` (solo train, determinista seed 1234, DDP-safe) conserva solo esa fracción de las
+imágenes sin etiqueta para reequilibrar el ~46% de fondo.
+
+### `train.py` — flags + optimizador + currículum
+- Nuevos: `--fov_spatial`, `--fov_empty_weight`(0), `--fov_w_r`, `--fov_w_floor`, `--fov_r_lo`,
+  `--fov_r_hi`, `--fov_s_ref`, `--fov_r_floor`, `--fov_warmup_epochs`(3), `--fov_warmup_R`(0.3),
+  `--fov_lr_mult`(5), `--bg_keep_frac`. (`--fov_r_empty` eliminado.)
+- **Grupo de LR separado** para `fov_estimator` (scout) con `lr·fov_lr_mult`; `set_lr` respeta el
+  `lr_scale` por grupo.
+- Currículum por época: fija `_fixed_R=fov_warmup_R` mientras `epoch < fov_warmup_epochs`.
+
+**Éxito esperado en los diagnósticos `fov/`**: `R_mean` se mantiene ≳0.1 (no →0), `dist_to_gt`
+baja del baseline de centro (0.418) y `o_x_std` sube (prueba que `o` varía por imagen).
+Pendiente: lanzar et67 y validar. (Propuesta 9 — multi-lupa/top-k — NO hecha aún.)
+
+---
+
 ## ⏳ PENDIENTE
 
 ### Thresholds de tamaño COCO en `[-1,1]` — `telescope/eval.py`
