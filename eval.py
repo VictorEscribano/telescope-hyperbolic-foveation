@@ -40,7 +40,11 @@ def parse_args():
     p.add_argument("--num_workers",   type=int, default=4)
     p.add_argument("--image_size",    type=int, nargs=2, default=[1024, 1024])
     p.add_argument("--score_threshold", type=float, default=0.05)
-    p.add_argument("--fp16",          action="store_true", default=True)
+    p.add_argument("--fp16",    dest="fp16", action="store_true", default=True,
+                   help="run inference under fp16 autocast (default)")
+    p.add_argument("--no_fp16", dest="fp16", action="store_false",
+                   help="run inference in fp32 — matches train.py's validation. "
+                        "Use to check whether fp16 autocast degrades the model.")
     p.add_argument("--backbone", type=str, default="sam3",
                    choices=["sam3", "efficienttam"],
                    help="must match the backbone the checkpoint was trained with")
@@ -54,6 +58,9 @@ def parse_args():
                    help="build the DINO two-stage head (default; must match training)")
     p.add_argument("--no_two_stage", dest="two_stage", action="store_false",
                    help="build the one-stage head — use for checkpoints trained with --no_two_stage")
+    p.add_argument("--fov_spatial",  action="store_true", default=False,
+                   help="build the spatial soft-argmax foveation head — MUST match training "
+                        "(set this for checkpoints trained with --fov_spatial, else load fails)")
     p.add_argument("--output_file",   type=str, default=None,
                    help="save results JSON to this path")
     return p.parse_args()
@@ -128,7 +135,8 @@ def main():
                                      NUM_CLASSES, CLASS_NAMES)
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = TelescopeModel(num_classes=NUM_CLASSES, two_stage=args.two_stage).to(device)
+    model = TelescopeModel(num_classes=NUM_CLASSES, two_stage=args.two_stage,
+                           fov_spatial=args.fov_spatial).to(device)
 
     # Match the training-time architecture so the checkpoint loads: if trained
     # with the real SAM3 backbone, rebuild it before load_state_dict (its weights

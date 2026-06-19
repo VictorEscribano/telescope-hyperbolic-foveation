@@ -23,7 +23,7 @@ from .box import riemannian_to_euclidean_box
 from .head import generalized_box_iou
 
 __all__ = ["HungarianMatcher", "match_and_compute_loss", "compute_denoising_loss",
-           "compute_encoder_aux_loss"]
+           "compute_encoder_aux_loss", "compute_foveation_loss"]
 
 
 class HungarianMatcher:
@@ -204,6 +204,82 @@ def match_and_compute_loss(
         loss_giou=loss_giou,
         loss_cls=loss_cls,
         n_matched=n_matched,
+    )
+
+
+def compute_foveation_loss(
+    o:              Tensor,    # (B, 2) predicted foveation centre in [-1, 1]
+    R:              Tensor,    # (B,)   predicted foveation radius
+    gt_boxes_list:  list,      # list of B tensors (M_b, 4) [cx,cy,w,h] in [-1, 1]
+    w_empty:        float = 0.0,
+    w_r:            float = 1.0,
+    w_floor:        float = 1.0,
+    r_lo:           float = 0.05,
+    r_hi:           float = 0.40,
+    s_ref:          float = 1.0,
+    r_floor:        float = 0.05,
+) -> dict:
+    """Directly supervise the foveation parameters (o, R).
+
+    The FoveationEstimator predicts (o, R) and, without guidance, collapses:
+    in drones_et65 ``o`` pinned to a corner; in drones_et66 ``o``→centre and
+    ``R``→0 (the lens stopped magnifying).  The R-collapse happened because
+    NOTHING in the loss rewarded a large R — the old empty-image term actively
+    pulled R→r_empty on ~half the frames, and detection alone never needed zoom.
+    This loss fixes that:
+
+      • images WITH drones:
+          – pull ``o`` toward the GT centroid (aim the lens at the target);
+          – pull ``R`` toward a size-dependent target ``r_tgt`` — SMALL drones
+            ask for a LARGER lens (more area devoted to magnification), large
+            drones ask for ~r_lo.  ``r_tgt`` uses the smallest box in the frame
+            (the one that most needs zoom).  This is the term that gives R a
+            reason to GROW.
+          – an anti-collapse hinge ``relu(r_floor − R)`` keeps R off zero.
+      • images WITHOUT drones: by default NOT supervised (w_empty=0) — we no
+        longer teach the lens to shrink on the ~half empty frames.  Set w_empty>0
+        to softly pull ``o`` toward the centre on empties.
+
+    Box dims (w,h) are in the [-1,1] frame (image spans 2 units); the object's
+    linear size is ``s = sqrt(w*h)`` and ``r_tgt = clamp(r_hi-(r_hi-r_lo)*s/s_ref,
+    r_lo, r_hi)``.
+
+    Returns dict: loss_fov, loss_fov_o, loss_fov_r, loss_fov_floor,
+    loss_fov_neg, n_fov (#images with GT).
+    """
+    B = o.shape[0]
+    loss_o     = o.new_zeros(1)
+    loss_r     = o.new_zeros(1)
+    loss_floor = o.new_zeros(1)
+    loss_neg   = o.new_zeros(1)
+    n_pos = 0
+    for b in range(B):
+        gt = gt_boxes_list[b].to(o.device, o.dtype)
+        if gt.shape[0] > 0:
+            centroid = gt[:, :2].mean(0)                       # (2,) in [-1, 1]
+            loss_o = loss_o + F.smooth_l1_loss(o[b], centroid)
+            # size-dependent R target from the SMALLEST box (most needs zoom)
+            wh    = gt[:, 2:4].clamp(min=1e-4)
+            s_min = (wh[:, 0] * wh[:, 1]).sqrt().min()         # linear size, [-1,1] units
+            r_tgt = (r_hi - (r_hi - r_lo) * (s_min / s_ref)).clamp(r_lo, r_hi)
+            loss_r     = loss_r + F.smooth_l1_loss(R[b], r_tgt.detach())
+            loss_floor = loss_floor + F.relu(R.new_tensor(r_floor) - R[b])
+            n_pos += 1
+        elif w_empty > 0:
+            loss_neg = loss_neg + F.smooth_l1_loss(o[b], torch.zeros_like(o[b]))
+    n_pos_d = max(n_pos, 1)
+    n_neg_d = max(B - n_pos, 1)
+    loss_o     = loss_o / n_pos_d
+    loss_r     = loss_r / n_pos_d
+    loss_floor = loss_floor / n_pos_d
+    loss_neg   = loss_neg / n_neg_d
+    return dict(
+        loss_fov=loss_o + w_r * loss_r + w_floor * loss_floor + w_empty * loss_neg,
+        loss_fov_o=loss_o,
+        loss_fov_r=loss_r,
+        loss_fov_floor=loss_floor,
+        loss_fov_neg=loss_neg,
+        n_fov=n_pos,
     )
 
 

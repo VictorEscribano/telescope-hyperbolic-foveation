@@ -61,10 +61,11 @@ class DronesYoloDataset(Dataset):
 
     def __init__(
         self,
-        root_dir:   str,
-        split:      str = "train",
-        image_size: Tuple[int, int] = (1024, 1024),
-        keep_empty: bool = True,
+        root_dir:      str,
+        split:         str = "train",
+        image_size:    Tuple[int, int] = (1024, 1024),
+        keep_empty:    bool = True,
+        bg_keep_frac:  float = 1.0,
     ) -> None:
         split = _SPLIT_ALIASES.get(split, split)
         self.root       = Path(root_dir)
@@ -83,6 +84,17 @@ class DronesYoloDataset(Dataset):
                         if p.suffix.lower() in _IMG_EXTS)
         if not keep_empty:
             images = [p for p in images if self._label_path(p).is_file()]
+        # Subsample background (label-less) images to rebalance the dataset
+        # (~half the train split is empty bird hard-negatives).  Deterministic
+        # so the kept set is identical across DDP ranks and resumes.
+        elif bg_keep_frac < 1.0:
+            import random
+            fg = [p for p in images if self._label_path(p).is_file()]
+            bg = [p for p in images if not self._label_path(p).is_file()]
+            keep_n = int(round(len(bg) * max(0.0, bg_keep_frac)))
+            if keep_n < len(bg):
+                bg = random.Random(1234).sample(bg, keep_n)
+            images = sorted(fg + bg)
         if not images:
             raise RuntimeError(f"No images found under {self.img_dir}")
         self.images: List[Path] = images

@@ -447,6 +447,7 @@ class TelescopeModel(nn.Module):
         enc_out_dim:  int = 256,
         low_res_size: int = 512,
         two_stage:    bool = True,
+        fov_spatial:  bool = False,
     ) -> None:
         super().__init__()
 
@@ -458,7 +459,8 @@ class TelescopeModel(nn.Module):
         # real SAM3 features instead of a random stub, and uses the paper's 512²
         # rather than a 64² thumbnail.
         self.low_res_size    = low_res_size
-        self.fov_estimator   = FoveationEstimator(query_dim * 3, hidden=enc_out_dim)
+        self.fov_estimator   = FoveationEstimator(query_dim * 3, hidden=enc_out_dim,
+                                                  feat_ch=query_dim, spatial_o=fov_spatial)
         self.warp_layer      = FoveationWarpLayer(alpha=2.0, p=2.0)
         self.hyperbolic_emb  = HyperbolicEmbedding(param_dim=4, query_dim=query_dim)
 
@@ -520,13 +522,23 @@ class TelescopeModel(nn.Module):
         feats_low  = self.backbone(small)                  # 3 FPN tensors (coarse→fine)
         # Global pool each scale and concatenate
         enc_vec    = torch.cat([f.flatten(2).mean(-1) for f in feats_low], dim=-1)  # (B, C*3)
-        o, R       = self.fov_estimator(enc_vec)           # (B,2), (B,)
+        # Finest feature map (last, finest-resolution level) drives the spatial
+        # soft-argmax for `o` when the estimator is in spatial mode.
+        o, R       = self.fov_estimator(enc_vec, feats_low[-1])   # (B,2), (B,)
 
         # Baseline ablation: force R≈0 so w(r)=0 and Φ(x)=x everywhere.  This
         # keeps warp, embedding, and box-decode all consistent on the identity
         # transform (see train.py --no_foveation).
         if getattr(self.fov_estimator, "_no_foveation", False):
             R = torch.full_like(R, 1e-3)
+
+        # Curriculum (train.py --fov_warmup_epochs): force a fixed, sizeable R for
+        # the first few epochs so the detection head learns to USE magnified
+        # features before R becomes learnable.  Breaks the chicken-and-egg where
+        # the head can't exploit zoom → zoom looks useless → R collapses to 0.
+        _fixed_R = getattr(self.fov_estimator, "_fixed_R", None)
+        if _fixed_R is not None:
+            R = torch.full_like(R, float(_fixed_R))
 
         # ── Stage 1b: warp full-resolution image ──────────────────────────────
         warped     = self.warp_layer(image, o, R)          # (B, 3, H, W)
