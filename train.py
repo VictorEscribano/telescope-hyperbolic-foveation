@@ -20,6 +20,7 @@ Key hyperparameters match paper Table 9:
 import argparse
 import math
 import os
+import json
 import sys
 import time
 from pathlib import Path
@@ -77,7 +78,14 @@ def parse_args():
     p.add_argument("--fp16",        action="store_true", default=True)
     p.add_argument("--grad_clip",   type=float, default=0.1)
     p.add_argument("--resume",      type=str, default=None,
-                   help="path to checkpoint dir to resume from")
+                   help="path to checkpoint dir to resume from (loads weights + "
+                        "optimizer + epoch; continues the SAME schedule)")
+    p.add_argument("--init_from",   type=str, default=None,
+                   help="warm-start: load ONLY model weights from this checkpoint "
+                        "(file or run dir), then train fresh from epoch 0 with the "
+                        "current hyperparameters/schedule. Unlike --resume it does "
+                        "NOT restore the optimizer, so new --fov_lr_mult etc. apply. "
+                        "Use to continue from a previous run while changing HPs.")
     p.add_argument("--backbone", type=str, default="sam3",
                    choices=["sam3", "efficienttam"],
                    help="which frozen backbone to load when --backbone_ckpt is given. "
@@ -147,6 +155,15 @@ def parse_args():
     p.add_argument("--bg_keep_frac", type=float, default=1.0,
                    help="fraction of background (no-drone) TRAIN images to keep "
                         "(e.g. 0.5 halves them to rebalance; 1.0 keeps all)")
+    p.add_argument("--report", dest="report", action="store_true", default=True,
+                   help="write an HTML report (curves + foveation + detection "
+                        "panels) to <output_dir>/report.html at the end (rank 0)")
+    p.add_argument("--no_report", dest="report", action="store_false",
+                   help="skip the end-of-training HTML report")
+    p.add_argument("--report_n_images", type=int, default=8,
+                   help="number of val/test images in the report detection panels")
+    p.add_argument("--report_score_thr", type=float, default=0.3,
+                   help="score threshold for predicted boxes shown in the report")
     p.add_argument("--lr_min_ratio", type=float, default=0.01,
                    help="cosine-decay floor as a fraction of --lr (LR decays from "
                         "lr after warm-up down to lr*lr_min_ratio by the last epoch)")
@@ -216,6 +233,22 @@ def main():
     for p in model.backbone.parameters():
         p.requires_grad_(False)
 
+    # Warm-start (weights only, no optimizer/epoch) — load AFTER the backbone so
+    # a previous run's trained scout/head/embedding override the fresh init while
+    # the frozen backbone weights stay as loaded.  strict=False tolerates minor
+    # head differences; missing/unexpected keys are reported.
+    if args.init_from:
+        ckpt_path = args.init_from
+        if os.path.isdir(ckpt_path):
+            cand = os.path.join(ckpt_path, "checkpoint_best.pt")
+            ckpt_path = cand if os.path.exists(cand) else os.path.join(ckpt_path, "checkpoint_last.pt")
+        sd = torch.load(ckpt_path, map_location=device, weights_only=False)
+        sd = sd.get("model_state_dict", sd)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if is_main:
+            print(f"[init_from] warm-started weights ← {ckpt_path} "
+                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
+
     if world_size > 1:
         # find_unused_parameters: two-stage leaves the learned object_queries /
         # ref_pts (requires_grad=True but unused — queries come from encoder
@@ -247,6 +280,12 @@ def main():
 
     # ── Checkpoint manager ────────────────────────────────────────────────────
     ckpt_mgr    = CheckpointManager(args.output_dir, keep_last=args.keep_last)
+    # Persist the run's hyperparameters so the HTML report can show them (with
+    # tooltips) and the standalone report.py can reload them.
+    if is_main:
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, "args.json"), "w") as _f:
+            json.dump(vars(args), _f, indent=2, default=str)
     start_epoch = 0
     if args.resume:
         ckpt_mgr_resume = CheckpointManager(args.resume)
@@ -515,6 +554,25 @@ def main():
 
     if is_main and logger is not None:
         logger.plot()
+
+    # ── End-of-training HTML report (rank 0 only) ─────────────────────────────
+    # Curves + foveation diagnostics + val/test detection panels (GT vs pred and
+    # the foveated image with o,R).  Wrapped in try/except so a report failure
+    # never loses a finished run.
+    if is_main and args.report and args.dataset == "drones":
+        try:
+            from report import generate_report
+            _m = model.module if world_size > 1 else model
+            generate_report(
+                args.output_dir, _m, device, DatasetCls, args.val_dir,
+                image_size=tuple(args.image_size),
+                alpha=_m.alpha, p=_m.p,
+                n_images=args.report_n_images,
+                score_threshold=args.report_score_thr,
+                fp16=args.fp16, title=Path(args.output_dir).name,
+            )
+        except Exception as exc:                              # noqa: BLE001
+            print(f"[report] generation failed (run is safe): {exc}")
 
     if world_size > 1:
         dist.destroy_process_group()
